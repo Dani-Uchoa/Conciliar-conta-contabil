@@ -4,7 +4,7 @@ import itertools
 import io
 from decimal import Decimal, ROUND_HALF_UP
 
-st.set_page_config(page_title="Conciliador Contábil", layout="wide")
+st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
 
 def formatar_moeda(v):
     try:
@@ -12,8 +12,8 @@ def formatar_moeda(v):
     except:
         return Decimal('0.00')
 
-def processar_conciliacao(df_raw, conta_alvo):
-    # Limpeza e padronização
+def limpar_dados_dominio(df_raw):
+    """Higieniza e padroniza a extração bruta da Domínio Sistemas."""
     df_clean = df_raw.dropna(how='all', axis=1).dropna(how='all', axis=0).copy()
     headers = df_clean.iloc[0].tolist()
     
@@ -35,7 +35,10 @@ def processar_conciliacao(df_raw, conta_alvo):
     
     df_main['Valor'] = df_main['Valor'].apply(formatar_moeda)
     df_main['Data'] = pd.to_datetime(df_main['Data'], errors='coerce')
+    return df_main
 
+def processar_fornecedores(df_main, conta_alvo):
+    """Algoritmo Combinatório (Subset Sum) para Contas a Pagar."""
     pagamentos = df_main[df_main['Débito'] == conta_alvo].to_dict('records')
     notas_fiscais = df_main[df_main['Crédito'] == conta_alvo].to_dict('records')
 
@@ -74,17 +77,15 @@ def processar_conciliacao(df_raw, conta_alvo):
     pag_sobra = [pag for i, pag in enumerate(pagamentos) if i not in ids_conciliados_pag]
     nf_sobra = [nf for i, nf in enumerate(notas_fiscais) if i not in ids_conciliados_nf]
 
-    # CLASSIFICAÇÃO DOS CENÁRIOS
+    # Classificação
     pagos_antecipados = []
     for rel in relacoes_validadas:
-        data_nf_mais_antiga = min([nf['Data'] for nf in rel['nfs']])
-        data_pag_mais_antiga = min([pag['Data'] for pag in rel['pags']])
-        if data_pag_mais_antiga < data_nf_mais_antiga:
+        data_nf_min = min([nf['Data'] for nf in rel['nfs']])
+        data_pag_min = min([pag['Data'] for pag in rel['pags']])
+        if data_pag_min < data_nf_min:
             pagos_antecipados.append({
-                'Data Pagamento': data_pag_mais_antiga.strftime('%d/%m/%Y'), 
-                'Valor Pagamento': float(rel['pags'][0]['Valor']),
-                'Data NF': data_nf_mais_antiga.strftime('%d/%m/%Y'), 
-                'Doc NF': rel['nfs'][0]['Documento']
+                'Data Pagamento': data_pag_min.strftime('%d/%m/%Y'), 'Valor Pagamento': float(rel['pags'][0]['Valor']),
+                'Data NF': data_nf_min.strftime('%d/%m/%Y'), 'Doc NF': rel['nfs'][0]['Documento']
             })
 
     divergencia_juros = []
@@ -95,7 +96,6 @@ def processar_conciliacao(df_raw, conta_alvo):
         if i in ids_pag_juros: continue
         for j, nf in enumerate(nf_sobra):
             if j in ids_nf_juros: continue
-            
             if pag['Data'] >= nf['Data'] and pag['Valor'] > nf['Valor']:
                 diferenca = pag['Valor'] - nf['Valor']
                 if diferenca <= (nf['Valor'] * Decimal('0.15')):
@@ -107,7 +107,6 @@ def processar_conciliacao(df_raw, conta_alvo):
                     ids_nf_juros.add(j)
                     break
 
-    # Formatando as sobras reais para exportação
     nfs_abertas_reais = [{
         'Doc': nf['Documento'], 'Emissão': nf['Data'].strftime('%d/%m/%Y'), 
         'Valor': float(nf['Valor']), 'Histórico': nf['Histórico']
@@ -118,77 +117,113 @@ def processar_conciliacao(df_raw, conta_alvo):
         'Histórico': pag['Histórico']
     } for i, pag in enumerate(pag_sobra) if i not in ids_pag_juros]
 
-    # Formatando os conciliados para exportação
-    lista_conciliados = []
+    conciliados_exp = []
     for rel in relacoes_validadas:
         pag = rel['pags'][0]
         for nf in rel['nfs']:
-            lista_conciliados.append({
-                'Data Pagamento': pag['Data'].strftime('%d/%m/%Y'),
-                'Valor Pagamento': float(pag['Valor']),
-                'Data NF': nf['Data'].strftime('%d/%m/%Y'),
-                'Doc NF': nf['Documento'],
-                'Valor NF': float(nf['Valor'])
+            conciliados_exp.append({
+                'Data Pagamento': pag['Data'].strftime('%d/%m/%Y'), 'Valor Pagamento': float(pag['Valor']),
+                'Data NF': nf['Data'].strftime('%d/%m/%Y'), 'Doc NF': nf['Documento'], 'Valor NF': float(nf['Valor'])
             })
 
-    return nfs_abertas_reais, pags_orfaos_reais, pagos_antecipados, divergencia_juros, lista_conciliados
+    return nfs_abertas_reais, pags_orfaos_reais, pagos_antecipados, divergencia_juros, conciliados_exp
 
-def gerar_excel_memoria(nfs, pags, antecipados, juros, conciliados):
-    """Gera um arquivo Excel na memória RAM (BytesIO) com abas separadas."""
+def processar_cartoes_fifo(df_main, conta_alvo):
+    """Algoritmo FIFO para Contas a Receber sem Chave Primária (Cartões/Getnet)."""
+    df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
+    
+    vendas = df_alvo[df_alvo['Débito'] == conta_alvo].sort_values('Data').to_dict('records')
+    recebimentos = df_alvo[df_alvo['Crédito'] == conta_alvo].sort_values('Data').to_dict('records')
+    
+    for v in vendas:
+        v['Saldo_Pendente'] = v['Valor']
+
+    idx_venda = 0
+    total_vendas = len(vendas)
+
+    for rec in recebimentos:
+        credito_disponivel = rec['Valor']
+        while credito_disponivel > Decimal('0.00') and idx_venda < total_vendas:
+            venda_atual = vendas[idx_venda]
+            if venda_atual['Saldo_Pendente'] <= credito_disponivel:
+                credito_disponivel -= venda_atual['Saldo_Pendente']
+                venda_atual['Saldo_Pendente'] = Decimal('0.00')
+                idx_venda += 1
+            else:
+                venda_atual['Saldo_Pendente'] -= credito_disponivel
+                credito_disponivel = Decimal('0.00')
+
+    sobra_a_receber = [{
+        'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
+        'Valor Original': float(v['Valor']), 'Saldo Pendente': float(v['Saldo_Pendente'])
+    } for v in vendas if v['Saldo_Pendente'] > Decimal('0.00')]
+    
+    total_gerado = sum(v['Valor'] for v in vendas)
+    total_pago = sum(r['Valor'] for r in recebimentos)
+    
+    return float(total_gerado), float(total_pago), sobra_a_receber
+
+def gerar_excel_memoria(dfs_dict):
+    """Gera o arquivo Excel dinamicamente com base nas abas fornecidas."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        if conciliados: pd.DataFrame(conciliados).to_excel(writer, index=False, sheet_name='Conciliados')
-        if nfs: pd.DataFrame(nfs).to_excel(writer, index=False, sheet_name='NFs Abertas')
-        if pags: pd.DataFrame(pags).to_excel(writer, index=False, sheet_name='Pagamentos sem NF')
-        if antecipados: pd.DataFrame(antecipados).to_excel(writer, index=False, sheet_name='Pagos Antecipados')
-        if juros: pd.DataFrame(juros).to_excel(writer, index=False, sheet_name='Divergência Juros')
+        for sheet_name, data in dfs_dict.items():
+            if data: pd.DataFrame(data).to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
-# --- INTERFACE WEB ---
-st.title("Conciliação Contábil - Domínio Sistemas")
-st.markdown("Identificador analítico de divergências, pagamentos órfãos e antecipações.")
+# --- INTERFACE WEB (STREAMLIT) ---
+st.title("Auditoria Contábil - Domínio Sistemas")
+st.markdown("Ferramenta técnica para identificação de divergências e análise de saldo.")
 
-conta_input = st.number_input("Digite a conta contábil do Fornecedor para análise (Ex: 1059)", value=1059, step=1)
-arquivo_anexado = st.file_uploader("Anexe o relatório da Domínio (.xlsx)", type=["xlsx"])
+modo = st.radio("Selecione o Modelo de Regra de Negócio:", 
+                ["1. Fornecedores (Cruzamento Exato e Agrupado)", "2. Cartões / Getnet (Baixa FIFO Cronológica)"])
 
-if arquivo_anexado:
+conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
+arquivo_anexado = st.file_uploader("Anexe o relatório bruto (.xlsx)", type=["xlsx"])
+
+if arquivo_anexado and conta_input != 0:
     try:
         df_bruto = pd.read_excel(arquivo_anexado, header=5)
-        nfs, pags, antecipados, juros, conciliados = processar_conciliacao(df_bruto, conta_input)
+        df_limpo = limpar_dados_dominio(df_bruto)
         
-        st.success("Análise matemática concluída.")
+        st.success("Planilha higienizada com sucesso. Executando motor matemático...")
         
-        # Geração do arquivo para download
-        excel_data = gerar_excel_memoria(nfs, pags, antecipados, juros, conciliados)
-        st.download_button(
-            label="📥 Baixar Relatório Completo (Excel)",
-            data=excel_data,
-            file_name=f"Relatorio_Conciliacao_Conta_{conta_input}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        
-        st.markdown("---")
-        
-        # Resumo visual na tela
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.warning(f"1. Consta a entrada, mas não consta o pagamento: {len(nfs)} NF(s)")
-            for nf in nfs:
-                st.write(f"-> Doc: {nf['Doc']} | Emissão: {nf['Emissão']} | R$ {nf['Valor']}")
+        if "1. Fornecedores" in modo:
+            nfs, pags, antecipados, juros, conciliados = processar_fornecedores(df_limpo, conta_input)
+            
+            excel_data = gerar_excel_memoria({
+                'Conciliados': conciliados, 'NFs Abertas': nfs, 
+                'Pagamentos sem NF': pags, 'Pagos Antecipados': antecipados, 'Divergência Juros': juros
+            })
+            
+            st.download_button(label="📥 Baixar Relatório (Fornecedores)", data=excel_data, 
+                               file_name=f"Auditoria_Fornecedor_{conta_input}.xlsx", 
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.warning(f"NFs Abertas (Falta Pagamento): {len(nfs)} registros")
+                st.info(f"Pagamentos Antecipados: {len(antecipados)} ocorrências")
+            with col2:
+                st.error(f"Pagamentos sem NF (Órfãos): {len(pags)} registros")
+                st.warning(f"Divergência de Valores (Juros): {len(juros)} casos")
                 
-            st.info(f"3. Notas pagas ANTES do lançamento da nota: {len(antecipados)} ocorrência(s)")
-            for p in antecipados:
-                st.write(f"-> NF {p['Doc NF']} (R$ {p['Valor Pagamento']}) paga em {p['Data Pagamento']}, mas lançada em {p['Data NF']}.")
-
-        with col2:
-            st.error(f"2. Notas pagas que não constam entradas (Sobras de Débito): {len(pags)} pagamento(s)")
-            for pag in pags:
-                st.write(f"-> Saída: {pag['Saída Bancária']} | R$ {pag['Valor']}")
-                
-            st.warning(f"4. Divergência de valores (Possível Juros por atraso): {len(juros)} caso(s)")
-            for j in juros:
-                st.write(f"-> NF {j['Doc NF']} (R$ {j['Valor NF']}) | Pagamento: R$ {j['Valor Pagamento']} | Lançar R$ {j['Juros Calculado']} como Juros")
-                
+        else:
+            t_gerado, t_pago, sobras = processar_cartoes_fifo(df_limpo, conta_input)
+            
+            excel_data = gerar_excel_memoria({'Saldo a Receber': sobras})
+            
+            st.download_button(label="📥 Baixar Relatório (Saldo Cartões)", data=excel_data, 
+                               file_name=f"Auditoria_Cartoes_{conta_input}.xlsx", 
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            
+            st.write("---")
+            st.subheader("Balanço Sintético do Período")
+            st.write(f"**Total Lançado (Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.write(f"**Total Baixado (Recebimento + Taxas):** R$ {t_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
+            saldo_real = sum(item['Saldo Pendente'] for item in sobras)
+            st.error(f"**Saldo Residual a Receber (Em Aberto):** R$ {saldo_real:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
     except Exception as e:
-        st.error(f"Erro ao processar a planilha. Verifique se a estrutura da Domínio está íntegra. Detalhe: {e}")
+        st.error(f"Falha na execução. Detalhe técnico: {e}")
