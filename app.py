@@ -15,33 +15,33 @@ def formatar_moeda(v):
         return Decimal('0.00')
 
 # ==========================================
-# MÓDULOS DE CACHE (LEITURA ÚNICA E RÁPIDA)
+# MÓDULOS DE CACHE E LEITURA (PARSERS)
 # ==========================================
 @st.cache_data
 def extrair_saldo_balancete(file_bytes, conta_alvo):
-    """Lê o arquivo massivo do Balancete uma única vez e o mantém em cache."""
+    """Lê o arquivo massivo do Balancete e extrai o Saldo Anterior."""
     df_balancete = pd.read_excel(io.BytesIO(file_bytes))
     header_idx = 0
     encontrou_cabecalho = False
     
     for idx, row in df_balancete.iterrows():
         row_str = ' '.join(str(x).upper() for x in row.values)
-        if 'CONTA' in row_str and 'ANTERIOR' in row_str:
+        if ('CÓDIGO' in row_str or 'CODIGO' in row_str or 'CONTA' in row_str) and 'ANTERIOR' in row_str:
             header_idx = idx
             encontrou_cabecalho = True
             break
             
     if not encontrou_cabecalho:
-        raise ValueError("Não foi possível localizar as palavras 'CONTA' e 'ANTERIOR' na mesma linha do balancete.")
+        raise ValueError("Não foi possível localizar as colunas de 'Código/Conta' e 'Saldo Anterior' no balancete.")
             
     df_bal = df_balancete.iloc[header_idx+1:].copy()
     df_bal.columns = [str(col).strip().upper() for col in df_balancete.iloc[header_idx].values]
     
-    col_conta = next((c for c in df_bal.columns if 'CONTA' == str(c).strip() or 'CONTA' in str(c)), None)
-    col_saldo = next((c for c in df_bal.columns if 'ANTERIOR' in str(c)), None)
+    col_conta = next((c for c in df_bal.columns if 'CÓDIGO' in c or 'CODIGO' in c or 'CONTA' in c), None)
+    col_saldo = next((c for c in df_bal.columns if 'ANTERIOR' in c), None)
     
     if not col_conta or not col_saldo:
-        raise ValueError("O layout do Balancete não contém colunas claras de 'Conta' e 'Saldo Anterior'.")
+        raise ValueError("O layout do Balancete não contém colunas claras de 'Código' e 'Saldo Anterior'.")
         
     df_bal[col_conta] = pd.to_numeric(df_bal[col_conta], errors='coerce')
     linha_conta = df_bal[df_bal[col_conta] == float(conta_alvo)]
@@ -54,7 +54,7 @@ def extrair_saldo_balancete(file_bytes, conta_alvo):
 
 @st.cache_data
 def carregar_base_lancamentos(file_bytes):
-    """Lê a base geral de Lançamentos uma única vez, padroniza e mantém em cache."""
+    """Lê a base geral de Lançamentos, padroniza e mantém em cache."""
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=5)
     df_clean = df_raw.dropna(how='all', axis=1).dropna(how='all', axis=0).copy()
     headers = df_clean.iloc[0].tolist()
@@ -288,7 +288,6 @@ saldo_abertura_var = Decimal('0.00')
 
 if arquivo_balancete and conta_input != 0:
     try:
-        # Acessa os bytes brutos do arquivo em vez do objeto Streamlit
         bytes_balancete = arquivo_balancete.getvalue()
         saldo_capturado = extrair_saldo_balancete(bytes_balancete, conta_input)
         saldo_abertura_var = saldo_capturado
@@ -303,7 +302,6 @@ if arquivo_lancamentos and conta_input != 0:
     try:
         st.info("Processando base de dados em cache...")
         
-        # O arquivo gigante é carregado aqui. Se a conta for alterada, esta linha será ignorada graças ao Cache.
         bytes_lancamentos = arquivo_lancamentos.getvalue()
         df_base_geral = carregar_base_lancamentos(bytes_lancamentos)
         
