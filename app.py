@@ -2,15 +2,48 @@ import streamlit as st
 import pandas as pd
 import itertools
 import io
+import re
 from decimal import Decimal, ROUND_HALF_UP
 
 st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
 
 def formatar_moeda(v):
     try:
+        # Se vier como string com vírgula, trata a conversão
+        if isinstance(v, str):
+            v = v.replace('.', '').replace(',', '.')
         return Decimal(str(v)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except:
         return Decimal('0.00')
+
+def varrer_balancete(df_balancete, conta_alvo):
+    """Lê o Balancete da Domínio, localiza a linha do cabeçalho e extrai o Saldo Anterior."""
+    header_idx = 0
+    # Procura dinamicamente onde o cabeçalho começa
+    for idx, row in df_balancete.iterrows():
+        row_str = ' '.join(str(x).upper() for x in row.values)
+        if 'CONTA' in row_str and 'ANTERIOR' in row_str:
+            header_idx = idx
+            break
+            
+    df_bal = df_balancete.iloc[header_idx+1:].copy()
+    df_bal.columns = df_balancete.iloc[header_idx].astype(str).str.strip().str.upper()
+    
+    # Isola as colunas vitais
+    col_conta = next((c for c in df_bal.columns if 'CONTA' == c.strip() or 'CONTA' in c), None)
+    col_saldo = next((c for c in df_bal.columns if 'ANTERIOR' in c), None)
+    
+    if not col_conta or not col_saldo:
+        raise ValueError("O layout do Balancete não contém colunas claras de 'Conta' e 'Saldo Anterior'.")
+        
+    df_bal[col_conta] = pd.to_numeric(df_bal[col_conta], errors='coerce')
+    linha_conta = df_bal[df_bal[col_conta] == float(conta_alvo)]
+    
+    if linha_conta.empty:
+        return Decimal('0.00')
+        
+    valor_bruto = linha_conta.iloc[0][col_saldo]
+    return formatar_moeda(valor_bruto)
 
 def limpar_dados_dominio(df_raw):
     df_clean = df_raw.dropna(how='all', axis=1).dropna(how='all', axis=0).copy()
@@ -44,7 +77,7 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     ids_conciliados_nf = set()
     relacoes_validadas = []
 
-    # FASE 1: Exato
+    # FASE 1: Cruzamento Exato
     for i, pag in enumerate(pagamentos):
         for j, nf in enumerate(notas_fiscais):
             if j not in ids_conciliados_nf and pag['Valor'] == nf['Valor']:
@@ -53,7 +86,7 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
                 relacoes_validadas.append({'pags': [pag], 'nfs': [nf]})
                 break
 
-    # FASE 2: Combinações
+    # FASE 2: Agrupamento
     for i, pag in enumerate(pagamentos):
         if i in ids_conciliados_pag: continue
         encontrado = False
@@ -75,7 +108,7 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     pag_sobra = [pag for i, pag in enumerate(pagamentos) if i not in ids_conciliados_pag]
     nf_sobra = [nf for i, nf in enumerate(notas_fiscais) if i not in ids_conciliados_nf]
 
-    # CLASSIFICAÇÃO: Antecipações
+    # CLASSIFICAÇÃO DOS CENÁRIOS
     pagos_antecipados = []
     for rel in relacoes_validadas:
         data_nf_min = min([nf['Data'] for nf in rel['nfs']])
@@ -87,7 +120,6 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
                 'Motivo': 'Data do pagamento anterior à emissão da NF'
             })
 
-    # CLASSIFICAÇÃO: Juros
     divergencia_juros = []
     ids_pag_juros = set()
     ids_nf_juros = set()
@@ -107,16 +139,15 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
                     ids_nf_juros.add(j)
                     break
 
-    # CLASSIFICAÇÃO: NFs em Aberto
     nfs_abertas_reais = [{
         'Doc': nf['Documento'], 'Emissão': nf['Data'].strftime('%d/%m/%Y'), 
         'Valor': float(nf['Valor']), 'Histórico': nf['Histórico'],
         'Motivo': 'Nota Fiscal sem pagamento correspondente'
     } for j, nf in enumerate(nf_sobra) if j not in ids_nf_juros]
     
-    # CLASSIFICAÇÃO: Absorção de Saldo Anterior e Pagamentos Órfãos
+    # Absorção de Saldo Anterior e Pagamentos Órfãos
     pags_brutos = [pag for i, pag in enumerate(pag_sobra) if i not in ids_pag_juros]
-    pags_brutos.sort(key=lambda x: x['Data']) # Ordenação Cronológica
+    pags_brutos.sort(key=lambda x: x['Data'])
     
     saldo_ant = Decimal(str(saldo_anterior_informado))
     pags_orfaos_finais = []
@@ -145,7 +176,6 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
                 'Motivo': 'Pagamento Órfão (Débito sem obrigação correspondente)'
             })
 
-    # CLASSIFICAÇÃO: Conciliados Exatos
     conciliados_exp = []
     for rel in relacoes_validadas:
         pag = rel['pags'][0]
@@ -175,7 +205,7 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
     for rec in recebimentos:
         credito_disponivel = rec['Valor']
         
-        # Abate do Saldo Anterior
+        # Abate do Saldo Anterior primeiro
         if saldo_anterior > Decimal('0.00'):
             if credito_disponivel >= saldo_anterior:
                 credito_disponivel -= saldo_anterior
@@ -184,7 +214,7 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
                 saldo_anterior -= credito_disponivel
                 credito_disponivel = Decimal('0.00')
                 
-        # Baixa FIFO nas vendas atuais
+        # Motor FIFO
         while credito_disponivel > Decimal('0.00') and idx_venda < total_vendas:
             venda_atual = vendas[idx_venda]
             if venda_atual['Saldo_Pendente'] <= credito_disponivel:
@@ -195,14 +225,12 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
                 venda_atual['Saldo_Pendente'] -= credito_disponivel
                 credito_disponivel = Decimal('0.00')
                 
-        # Se sobrou crédito e não há mais vendas
         if credito_disponivel > Decimal('0.00') and idx_venda >= total_vendas:
             recebimentos_orfaos.append({
                 'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Valor Órfão': float(credito_disponivel),
                 'Histórico': rec['Histórico'], 'Motivo': 'Recebimento sem Venda (Possível Antecipação ou Erro)'
             })
 
-    # Categorização Final de Vendas
     vendas_conciliadas = []
     vendas_pendentes = []
     
@@ -233,28 +261,45 @@ def gerar_excel_memoria(dfs_dict):
 
 # --- INTERFACE WEB (STREAMLIT) ---
 st.title("Auditoria Contábil - Domínio Sistemas")
-st.markdown("Ferramenta técnica para identificação de divergências, antecipações e baixas.")
+st.markdown("Ferramenta técnica para identificação de divergências e análise de saldo.")
 
 modo = st.radio("Selecione o Modelo de Regra de Negócio:", 
                 ["1. Fornecedores (Cruzamento Exato e Agrupado)", "2. Cartões / Contas sem ID (Baixa FIFO)"])
 
-col_conta, col_saldo = st.columns(2)
-with col_conta:
-    conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
-with col_saldo:
-    saldo_abertura = st.number_input("Saldo em Aberto Anterior (R$)", value=0.00, step=100.00)
+conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
 
-arquivo_anexado = st.file_uploader("Anexe o relatório bruto (.xlsx)", type=["xlsx"])
+# Upload duplo
+st.markdown("---")
+col_arq1, col_arq2 = st.columns(2)
+with col_arq1:
+    arquivo_lancamentos = st.file_uploader("1. Anexe os Lançamentos (.xlsx)", type=["xlsx"])
+with col_arq2:
+    arquivo_balancete = st.file_uploader("2. Anexe o Balancete Opcional (.xlsx)", type=["xlsx"])
 
-if arquivo_anexado and conta_input != 0:
+# Gerenciamento Dinâmico do Saldo
+saldo_abertura_var = Decimal('0.00')
+
+if arquivo_balancete and conta_input != 0:
     try:
-        df_bruto = pd.read_excel(arquivo_anexado, header=5)
+        df_bal = pd.read_excel(arquivo_balancete)
+        saldo_capturado = varrer_balancete(df_bal, conta_input)
+        saldo_abertura_var = saldo_capturado
+        st.success(f"✔️ Saldo Anterior de R$ {float(saldo_abertura_var):,.2f} capturado automaticamente do Balancete.".replace(",", "X").replace(".", ",").replace("X", "."))
+    except Exception as e:
+        st.error(f"Erro ao ler Balancete. Verifique se o arquivo está em .xlsx. Detalhe: {e}")
+        saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00)))
+else:
+    saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00, step=100.00)))
+
+if arquivo_lancamentos and conta_input != 0:
+    try:
+        df_bruto = pd.read_excel(arquivo_lancamentos, header=5)
         df_limpo = limpar_dados_dominio(df_bruto)
         
-        st.success("Planilha higienizada com sucesso. Executando motor matemático...")
+        st.info("Processando cálculos...")
         
         if "1. Fornecedores" in modo:
-            nfs, pags, antecipados, juros, conciliados, saldo_ant_restante = processar_fornecedores(df_limpo, conta_input, saldo_abertura)
+            nfs, pags, antecipados, juros, conciliados, saldo_ant_restante = processar_fornecedores(df_limpo, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
                 'Conciliados': conciliados, 'NFs Abertas': nfs, 
@@ -268,13 +313,11 @@ if arquivo_anexado and conta_input != 0:
             col1, col2 = st.columns(2)
             with col1:
                 st.warning(f"NFs Abertas (Falta Pagamento): {len(nfs)} registros")
-                st.info(f"Pagamentos Antecipados: {len(antecipados)} ocorrências")
             with col2:
-                st.error(f"Pagamentos Descasados (Inclui Baixa de Saldo Ant.): {len(pags)} registros")
-                st.warning(f"Divergência de Valores (Juros): {len(juros)} casos")
+                st.error(f"Pagamentos Descasados: {len(pags)} registros")
                 
         else:
-            t_gerado, t_pago, saldo_ant_pendente, v_conciliadas, v_pendentes, r_orfaos = processar_cartoes_fifo(df_limpo, conta_input, saldo_abertura)
+            t_gerado, t_pago, saldo_ant_pendente, v_conciliadas, v_pendentes, r_orfaos = processar_cartoes_fifo(df_limpo, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
                 'Vendas Conciliadas': v_conciliadas, 
@@ -288,12 +331,6 @@ if arquivo_anexado and conta_input != 0:
             
             st.write("---")
             st.subheader("Balanço Sintético do Período")
-            
-            if saldo_ant_pendente > 0:
-                st.error(f"**Alerta:** O banco não liquidou todo o Saldo Anterior. Restam R$ {saldo_ant_pendente:,.2f} em aberto do passado.".replace(",", "X").replace(".", ",").replace("X", "."))
-            else:
-                st.success("Saldo Anterior totalmente liquidado pelos recebimentos deste período.")
-
             st.write(f"**Total Lançado (Novas Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             st.write(f"**Total Baixado (Créditos/Taxas):** R$ {t_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
@@ -303,4 +340,4 @@ if arquivo_anexado and conta_input != 0:
             st.warning(f"**Saldo Residual a Receber (Novo Acumulado):** R$ {saldo_final_acumulado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
     except Exception as e:
-        st.error(f"Falha na execução. Detalhe técnico: {e}")
+        st.error(f"Falha na execução dos Lançamentos. Detalhe técnico: {e}")
