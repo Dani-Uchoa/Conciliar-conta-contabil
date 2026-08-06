@@ -21,28 +21,37 @@ def formatar_moeda(v):
 def extrair_saldo_balancete(file_bytes, conta_alvo):
     """Lê o arquivo massivo do Balancete e extrai o Saldo Anterior."""
     df_balancete = pd.read_excel(io.BytesIO(file_bytes))
-    header_idx = 0
-    encontrou_cabecalho = False
     
-    for idx, row in df_balancete.iterrows():
-        row_str = ' '.join(str(x).upper() for x in row.values)
-        if ('CÓDIGO' in row_str or 'CODIGO' in row_str or 'CONTA' in row_str) and 'ANTERIOR' in row_str:
-            header_idx = idx
-            encontrou_cabecalho = True
-            break
-            
-    if not encontrou_cabecalho:
-        raise ValueError("Não foi possível localizar as colunas de 'Código/Conta' e 'Saldo Anterior' no balancete.")
-            
-    df_bal = df_balancete.iloc[header_idx+1:].copy()
-    df_bal.columns = [str(col).strip().upper() for col in df_balancete.iloc[header_idx].values]
+    # 1. Verifica se o Pandas já colocou o cabeçalho automaticamente no topo (Linha 1)
+    cols_str = ' '.join(str(c).upper() for c in df_balancete.columns)
     
+    if ('CÓDIGO' in cols_str or 'CODIGO' in cols_str or 'CONTA' in cols_str) and 'ANTERIOR' in cols_str:
+        df_bal = df_balancete.copy()
+        df_bal.columns = [str(col).strip().upper() for col in df_balancete.columns]
+    
+    # 2. Se não estiver no topo, varre o meio do arquivo para achar o cabeçalho perdido
+    else:
+        header_idx = -1
+        for idx, row in df_balancete.iterrows():
+            row_str = ' '.join(str(x).upper() for x in row.values)
+            if ('CÓDIGO' in row_str or 'CODIGO' in row_str or 'CONTA' in row_str) and 'ANTERIOR' in row_str:
+                header_idx = idx
+                break
+                
+        if header_idx == -1:
+            raise ValueError("Não foi possível localizar as colunas de 'Código/Conta' e 'Saldo Anterior' no balancete.")
+            
+        df_bal = df_balancete.iloc[header_idx+1:].copy()
+        df_bal.columns = [str(col).strip().upper() for col in df_balancete.iloc[header_idx].values]
+    
+    # Localiza as colunas exatas
     col_conta = next((c for c in df_bal.columns if 'CÓDIGO' in c or 'CODIGO' in c or 'CONTA' in c), None)
     col_saldo = next((c for c in df_bal.columns if 'ANTERIOR' in c), None)
     
     if not col_conta or not col_saldo:
         raise ValueError("O layout do Balancete não contém colunas claras de 'Código' e 'Saldo Anterior'.")
         
+    # Trava a busca e extrai o saldo
     df_bal[col_conta] = pd.to_numeric(df_bal[col_conta], errors='coerce')
     linha_conta = df_bal[df_bal[col_conta] == float(conta_alvo)]
     
