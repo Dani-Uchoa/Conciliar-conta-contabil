@@ -13,7 +13,6 @@ def formatar_moeda(v):
         return Decimal('0.00')
 
 def limpar_dados_dominio(df_raw):
-    """Higieniza e padroniza a extração bruta da Domínio Sistemas."""
     df_clean = df_raw.dropna(how='all', axis=1).dropna(how='all', axis=0).copy()
     headers = df_clean.iloc[0].tolist()
     
@@ -38,7 +37,6 @@ def limpar_dados_dominio(df_raw):
     return df_main
 
 def processar_fornecedores(df_main, conta_alvo):
-    """Algoritmo Combinatório (Subset Sum) para Contas a Pagar."""
     pagamentos = df_main[df_main['Débito'] == conta_alvo].to_dict('records')
     notas_fiscais = df_main[df_main['Crédito'] == conta_alvo].to_dict('records')
 
@@ -46,7 +44,6 @@ def processar_fornecedores(df_main, conta_alvo):
     ids_conciliados_nf = set()
     relacoes_validadas = []
 
-    # FASE 1: Cruzamento Exato
     for i, pag in enumerate(pagamentos):
         for j, nf in enumerate(notas_fiscais):
             if j not in ids_conciliados_nf and pag['Valor'] == nf['Valor']:
@@ -55,7 +52,6 @@ def processar_fornecedores(df_main, conta_alvo):
                 relacoes_validadas.append({'pags': [pag], 'nfs': [nf]})
                 break
 
-    # FASE 2: Agrupamento
     for i, pag in enumerate(pagamentos):
         if i in ids_conciliados_pag: continue
         encontrado = False
@@ -77,7 +73,6 @@ def processar_fornecedores(df_main, conta_alvo):
     pag_sobra = [pag for i, pag in enumerate(pagamentos) if i not in ids_conciliados_pag]
     nf_sobra = [nf for i, nf in enumerate(notas_fiscais) if i not in ids_conciliados_nf]
 
-    # Classificação
     pagos_antecipados = []
     for rel in relacoes_validadas:
         data_nf_min = min([nf['Data'] for nf in rel['nfs']])
@@ -128,8 +123,7 @@ def processar_fornecedores(df_main, conta_alvo):
 
     return nfs_abertas_reais, pags_orfaos_reais, pagos_antecipados, divergencia_juros, conciliados_exp
 
-def processar_cartoes_fifo(df_main, conta_alvo):
-    """Algoritmo FIFO para Contas a Receber sem Chave Primária (Cartões/Getnet)."""
+def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
     df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
     
     vendas = df_alvo[df_alvo['Débito'] == conta_alvo].sort_values('Data').to_dict('records')
@@ -138,11 +132,23 @@ def processar_cartoes_fifo(df_main, conta_alvo):
     for v in vendas:
         v['Saldo_Pendente'] = v['Valor']
 
+    saldo_anterior = Decimal(str(saldo_anterior_informado))
     idx_venda = 0
     total_vendas = len(vendas)
 
     for rec in recebimentos:
         credito_disponivel = rec['Valor']
+        
+        # 1. Barreira Contábil: Liquidação prioritária do Saldo Anterior
+        if saldo_anterior > Decimal('0.00'):
+            if credito_disponivel >= saldo_anterior:
+                credito_disponivel -= saldo_anterior
+                saldo_anterior = Decimal('0.00')
+            else:
+                saldo_anterior -= credito_disponivel
+                credito_disponivel = Decimal('0.00')
+                
+        # 2. Motor FIFO: Liquidação das Vendas do Período
         while credito_disponivel > Decimal('0.00') and idx_venda < total_vendas:
             venda_atual = vendas[idx_venda]
             if venda_atual['Saldo_Pendente'] <= credito_disponivel:
@@ -161,10 +167,9 @@ def processar_cartoes_fifo(df_main, conta_alvo):
     total_gerado = sum(v['Valor'] for v in vendas)
     total_pago = sum(r['Valor'] for r in recebimentos)
     
-    return float(total_gerado), float(total_pago), sobra_a_receber
+    return float(total_gerado), float(total_pago), float(saldo_anterior), sobra_a_receber
 
 def gerar_excel_memoria(dfs_dict):
-    """Gera o arquivo Excel dinamicamente com base nas abas fornecidas."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         for sheet_name, data in dfs_dict.items():
@@ -178,7 +183,16 @@ st.markdown("Ferramenta técnica para identificação de divergências e anális
 modo = st.radio("Selecione o Modelo de Regra de Negócio:", 
                 ["1. Fornecedores (Cruzamento Exato e Agrupado)", "2. Cartões / Getnet (Baixa FIFO Cronológica)"])
 
-conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
+# Layout Dinâmico
+col_conta, col_saldo = st.columns(2)
+with col_conta:
+    conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
+
+saldo_abertura = 0.0
+if "2. Cartões" in modo:
+    with col_saldo:
+        saldo_abertura = st.number_input("Saldo em Aberto Anterior (R$)", value=0.00, step=100.00)
+
 arquivo_anexado = st.file_uploader("Anexe o relatório bruto (.xlsx)", type=["xlsx"])
 
 if arquivo_anexado and conta_input != 0:
@@ -209,7 +223,7 @@ if arquivo_anexado and conta_input != 0:
                 st.warning(f"Divergência de Valores (Juros): {len(juros)} casos")
                 
         else:
-            t_gerado, t_pago, sobras = processar_cartoes_fifo(df_limpo, conta_input)
+            t_gerado, t_pago, saldo_ant_pendente, sobras = processar_cartoes_fifo(df_limpo, conta_input, saldo_abertura)
             
             excel_data = gerar_excel_memoria({'Saldo a Receber': sobras})
             
@@ -219,11 +233,19 @@ if arquivo_anexado and conta_input != 0:
             
             st.write("---")
             st.subheader("Balanço Sintético do Período")
-            st.write(f"**Total Lançado (Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
+            if saldo_ant_pendente > 0:
+                st.error(f"**Alerta:** A adquirente não liquidou o Saldo Anterior. Restam R$ {saldo_ant_pendente:,.2f} atrasados do mês passado.".replace(",", "X").replace(".", ",").replace("X", "."))
+            else:
+                st.success("Saldo Anterior totalmente liquidado pelos recebimentos deste mês.")
+
+            st.write(f"**Total Lançado (Novas Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             st.write(f"**Total Baixado (Recebimento + Taxas):** R$ {t_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
-            saldo_real = sum(item['Saldo Pendente'] for item in sobras)
-            st.error(f"**Saldo Residual a Receber (Em Aberto):** R$ {saldo_real:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            saldo_real_periodo = sum(item['Saldo Pendente'] for item in sobras)
+            saldo_final_acumulado = saldo_ant_pendente + saldo_real_periodo
+            
+            st.warning(f"**Saldo Residual a Receber (Novo Acumulado):** R$ {saldo_final_acumulado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
