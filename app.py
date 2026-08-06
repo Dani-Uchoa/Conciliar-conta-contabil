@@ -19,17 +19,13 @@ def formatar_moeda(v):
 # ==========================================
 @st.cache_data
 def extrair_saldo_balancete(file_bytes, conta_alvo):
-    """Lê o arquivo massivo do Balancete e extrai o Saldo Anterior."""
     df_balancete = pd.read_excel(io.BytesIO(file_bytes))
     
-    # 1. Verifica se o Pandas já colocou o cabeçalho automaticamente no topo (Linha 1)
     cols_str = ' '.join(str(c).upper() for c in df_balancete.columns)
     
     if ('CÓDIGO' in cols_str or 'CODIGO' in cols_str or 'CONTA' in cols_str) and 'ANTERIOR' in cols_str:
         df_bal = df_balancete.copy()
         df_bal.columns = [str(col).strip().upper() for col in df_balancete.columns]
-    
-    # 2. Se não estiver no topo, varre o meio do arquivo para achar o cabeçalho perdido
     else:
         header_idx = -1
         for idx, row in df_balancete.iterrows():
@@ -44,14 +40,12 @@ def extrair_saldo_balancete(file_bytes, conta_alvo):
         df_bal = df_balancete.iloc[header_idx+1:].copy()
         df_bal.columns = [str(col).strip().upper() for col in df_balancete.iloc[header_idx].values]
     
-    # Localiza as colunas exatas
     col_conta = next((c for c in df_bal.columns if 'CÓDIGO' in c or 'CODIGO' in c or 'CONTA' in c), None)
     col_saldo = next((c for c in df_bal.columns if 'ANTERIOR' in c), None)
     
     if not col_conta or not col_saldo:
         raise ValueError("O layout do Balancete não contém colunas claras de 'Código' e 'Saldo Anterior'.")
         
-    # Trava a busca e extrai o saldo
     df_bal[col_conta] = pd.to_numeric(df_bal[col_conta], errors='coerce')
     linha_conta = df_bal[df_bal[col_conta] == float(conta_alvo)]
     
@@ -63,7 +57,6 @@ def extrair_saldo_balancete(file_bytes, conta_alvo):
 
 @st.cache_data
 def carregar_base_lancamentos(file_bytes):
-    """Lê a base geral de Lançamentos, padroniza e mantém em cache."""
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=5)
     df_clean = df_raw.dropna(how='all', axis=1).dropna(how='all', axis=0).copy()
     headers = df_clean.iloc[0].tolist()
@@ -167,7 +160,7 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     pags_brutos = [pag for i, pag in enumerate(pag_sobra) if i not in ids_pag_juros]
     pags_brutos.sort(key=lambda x: x['Data'])
     
-    saldo_ant = Decimal(str(saldo_anterior_informado))
+    saldo_ant = abs(Decimal(str(saldo_anterior_informado)))
     pags_orfaos_finais = []
     
     for pag in pags_brutos:
@@ -195,13 +188,18 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
             })
 
     conciliados_exp = []
-    for rel in relacoes_validadas:
+    for idx_grupo, rel in enumerate(relacoes_validadas, 1):
         pag = rel['pags'][0]
-        for nf in rel['nfs']:
+        qtd_nfs = len(rel['nfs'])
+        for i_nf, nf in enumerate(rel['nfs']):
             conciliados_exp.append({
-                'Data Pagamento': pag['Data'].strftime('%d/%m/%Y'), 'Valor Pagamento': float(pag['Valor']),
-                'Data NF': nf['Data'].strftime('%d/%m/%Y'), 'Doc NF': nf['Documento'], 'Valor NF': float(nf['Valor']),
-                'Motivo': 'Conciliação Exata/Agrupada'
+                'ID Grupo': f"G-{idx_grupo}",
+                'Data Pagamento': pag['Data'].strftime('%d/%m/%Y') if i_nf == 0 else None,
+                'Valor Pagamento': float(pag['Valor']) if i_nf == 0 else None,
+                'Data NF': nf['Data'].strftime('%d/%m/%Y'), 
+                'Doc NF': nf['Documento'], 
+                'Valor NF': float(nf['Valor']),
+                'Motivo': 'Conciliação Agrupada' if qtd_nfs > 1 else 'Conciliação Exata'
             })
 
     return nfs_abertas_reais, pags_orfaos_finais, pagos_antecipados, divergencia_juros, conciliados_exp, float(saldo_ant)
@@ -215,22 +213,41 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
     for v in vendas:
         v['Saldo_Pendente'] = v['Valor']
 
-    saldo_anterior = Decimal(str(saldo_anterior_informado))
+    saldo_anterior = abs(Decimal(str(saldo_anterior_informado)))
     idx_venda = 0
     total_vendas = len(vendas)
+    
+    # LISTAS DE RASTREAMENTO
+    baixas_saldo_anterior = []
     recebimentos_orfaos = []
 
     for rec in recebimentos:
         credito_disponivel = rec['Valor']
         
+        # 1. Barreira do Saldo Anterior (Agora rastreada e documentada)
         if saldo_anterior > Decimal('0.00'):
             if credito_disponivel >= saldo_anterior:
+                baixas_saldo_anterior.append({
+                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'),
+                    'Histórico Bancário': rec['Histórico'],
+                    'Valor Recebido (Bruto)': float(rec['Valor']),
+                    'Valor Retido p/ Saldo Anterior': float(saldo_anterior),
+                    'Motivo': 'Liquidou o restante do Saldo Anterior'
+                })
                 credito_disponivel -= saldo_anterior
                 saldo_anterior = Decimal('0.00')
             else:
+                baixas_saldo_anterior.append({
+                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'),
+                    'Histórico Bancário': rec['Histórico'],
+                    'Valor Recebido (Bruto)': float(rec['Valor']),
+                    'Valor Retido p/ Saldo Anterior': float(credito_disponivel),
+                    'Motivo': 'Abatimento Parcial do Saldo Anterior'
+                })
                 saldo_anterior -= credito_disponivel
                 credito_disponivel = Decimal('0.00')
                 
+        # 2. Motor FIFO de Vendas Vigentes
         while credito_disponivel > Decimal('0.00') and idx_venda < total_vendas:
             venda_atual = vendas[idx_venda]
             if venda_atual['Saldo_Pendente'] <= credito_disponivel:
@@ -241,6 +258,7 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
                 venda_atual['Saldo_Pendente'] -= credito_disponivel
                 credito_disponivel = Decimal('0.00')
                 
+        # 3. Sobras reais
         if credito_disponivel > Decimal('0.00') and idx_venda >= total_vendas:
             recebimentos_orfaos.append({
                 'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Valor Órfão': float(credito_disponivel),
@@ -266,7 +284,7 @@ def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
     total_gerado = sum(v['Valor'] for v in vendas)
     total_pago = sum(r['Valor'] for r in recebimentos)
     
-    return float(total_gerado), float(total_pago), float(saldo_anterior), vendas_conciliadas, vendas_pendentes, recebimentos_orfaos
+    return float(total_gerado), float(total_pago), float(saldo_anterior), baixas_saldo_anterior, vendas_conciliadas, vendas_pendentes, recebimentos_orfaos
 
 def gerar_excel_memoria(dfs_dict):
     output = io.BytesIO()
@@ -333,9 +351,10 @@ if arquivo_lancamentos and conta_input != 0:
                 st.error(f"Pagamentos Descasados: {len(pags)} registros")
                 
         else:
-            t_gerado, t_pago, saldo_ant_pendente, v_conciliadas, v_pendentes, r_orfaos = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
+            t_gerado, t_pago, saldo_ant_pendente, baixas_ant, v_conciliadas, v_pendentes, r_orfaos = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
+                'Baixas do Ano Anterior': baixas_ant, # <--- ABA NOVA CRIADA AQUI
                 'Vendas Conciliadas': v_conciliadas, 
                 'Vendas Pendentes': v_pendentes, 
                 'Créditos Órfãos': r_orfaos
