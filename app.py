@@ -226,7 +226,7 @@ if arquivo_lancamentos and conta_input != 0:
         )
         
         # VALIDAÇÃO DE CONCILIAÇÃO (ALERTA VERMELHO)
-        if len(r_ant) == 0 e len(r_atual) == 0:
+        if len(r_ant) == 0 and len(r_atual) == 0:
             st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos matemáticos que fechassem saldos nesta conta.")
         
         excel_data = gerar_excel_memoria({
