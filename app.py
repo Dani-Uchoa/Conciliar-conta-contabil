@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import itertools
 import io
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -15,7 +14,7 @@ def formatar_moeda(v):
         return Decimal('0.00')
 
 # ==========================================
-# MÓDULOS DE CACHE E LEITURA (ROBUSTEZ XLS/XLSX)
+# MÓDULOS DE CACHE E LEITURA (ROBUSTEZ)
 # ==========================================
 @st.cache_data
 def extrair_saldo_balancete(raw_data, conta_alvo):
@@ -91,7 +90,7 @@ def carregar_base_lancamentos(raw_data):
     return df_main
 
 # ==========================================
-# MOTOR DOS 4 RAZÕES (MATCHING PROGRESSIVO AVANÇADO)
+# MOTOR HASH MAP (ALTA PERFORMANCE) E 4 RAZÕES
 # ==========================================
 def montar_tabela_razao(eventos):
     razao = []
@@ -138,17 +137,14 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     todos_debitos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
     todos_creditos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
 
-    # Matrizes Acumuladas
     d_cum = [sum(d['Débito'] for d in todos_debitos[:i+1]) for i in range(len(todos_debitos))]
     c_cum = [sum(c['Crédito'] for c in todos_creditos[:i+1]) for i in range(len(todos_creditos))]
     
     matches = []
     
-    # BUSCA PROGRESSIVA (De frente para trás)
-    for i in range(len(d_cum)):
-        target = d_cum[i]
-        
-        # 1. Interseção Perfeita
+    # MOTOR DE MATCHING ULTRA-RÁPIDO
+    for i, target in enumerate(d_cum):
+        # 1. Match Perfeito
         try:
             j = c_cum.index(target)
             matches.append((i, list(range(j+1))))
@@ -156,51 +152,34 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
         except ValueError:
             pass
             
-        # Ponto de partida
-        start_j = -1
-        for j in range(len(c_cum)):
-            if c_cum[j] > target:
-                start_j = j
-                break
-        
+        # 2. Match com 1 Omissão (Hash Map em vez de Loop Infinito)
+        start_j = next((idx for idx, val in enumerate(c_cum) if val > target), -1)
         if start_j == -1: continue
             
         found = False
-        # 2. Omissão de 1 Registro (Drop 1)
-        for j in range(start_j, len(c_cum)):
-            diff = c_cum[j] - target
-            subset = todos_creditos[:j+1]
-            for drop in range(j+1):
-                if subset[drop]['Crédito'] == diff:
-                    matches.append((i, [k for k in range(j+1) if k != drop]))
-                    found = True
-                    break
-            if found: break
-            
-        if found: continue
+        seen_credits = {}
         
-        # 3. Omissão de 2 Registros (Algoritmo Rápido Hash)
-        found = False
-        for j in range(start_j, min(len(c_cum), start_j + 60)):
+        # Preenche a memória até a posição inicial
+        for k in range(start_j):
+            seen_credits[todos_creditos[k]['Crédito']] = k
+            
+        # Analisa uma janela de segurança (máx 100 lançamentos à frente para evitar sobrecarga)
+        for j in range(start_j, min(len(c_cum), start_j + 100)):
+            c_val = todos_creditos[j]['Crédito']
+            seen_credits[c_val] = j
+            
             diff = c_cum[j] - target
-            subset = todos_creditos[:j+1]
-            seen = {}
-            for drop_idx, item in enumerate(subset):
-                val = item['Crédito']
-                needed = diff - val
-                if needed in seen:
-                    matches.append((i, [k for k in range(j+1) if k != drop_idx and k != seen[needed]]))
-                    found = True
-                    break
-                seen[val] = drop_idx
-            if found: break
+            if diff in seen_credits:
+                drop_idx = seen_credits[diff]
+                matches.append((i, [k for k in range(j+1) if k != drop_idx]))
+                found = True
+                break
 
-    # SEPARAÇÃO CRÍTICA (ANO ANTERIOR VS ATUAL)
+    # SEPARAÇÃO DAS 4 ABAS
     d_ant, c_ant = [], []
     d_atual, c_atual = [], []
     
     if matches:
-        # Pega a PRIMEIRA interseção para o Ano Anterior e a ÚLTIMA para o Atual
         primeiro_match = matches[0]
         ultimo_match = matches[-1]
         
@@ -228,7 +207,6 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
         d_pend = todos_debitos.copy()
         c_pend = todos_creditos.copy()
 
-    # Ordenação e Montagem das Tabelas
     todos_eventos = sorted(todos_debitos + todos_creditos, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
     eventos_ant = sorted(d_ant + c_ant, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
     eventos_atual = sorted(d_atual + c_atual, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
@@ -252,7 +230,7 @@ def gerar_excel_memoria(dfs_dict):
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
 st.title("Auditoria Contábil - Domínio Sistemas")
-st.markdown("Emissão Analítica de Livros Razão. Separação Estrita de Exercícios.")
+st.markdown("Emissão Analítica de Livros Razão. Motor de Hash de Alta Performance.")
 
 modo = st.radio("Selecione a Natureza da Conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
 conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
@@ -282,7 +260,6 @@ if arquivo_lancamentos and conta_input != 0:
         bytes_lancamentos = arquivo_lancamentos.getvalue()
         df_base_geral = carregar_base_lancamentos(bytes_lancamentos)
         
-        # VALIDAÇÃO BLOQUEANTE DA CONTA
         tem_na_base = (df_base_geral['Débito'] == conta_input).any() or (df_base_geral['Crédito'] == conta_input).any()
         if not tem_na_base:
             st.error(f"❌ EXECUÇÃO BLOQUEADA: A conta {conta_input} não possui lançamentos no arquivo anexado. Digite o número correto.")
@@ -294,7 +271,6 @@ if arquivo_lancamentos and conta_input != 0:
             df_base_geral, conta_input, saldo_abertura_var, tipo_auditoria
         )
         
-        # VALIDAÇÃO DE CONCILIAÇÃO (ALERTA VERMELHO)
         if len(r_ant) == 0 and len(r_atual) == 0:
             st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos exatos na base enviada.")
         
@@ -323,7 +299,7 @@ if arquivo_lancamentos and conta_input != 0:
             st.warning(f"**Aba 4 (Pend)**\nR$ {s_pend:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
         if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
-            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 e o saldo bate com o Razão Total.")
+            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 perfeitamente.")
         
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
