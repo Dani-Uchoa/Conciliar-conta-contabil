@@ -17,12 +17,12 @@ def formatar_moeda(v):
 # MÓDULOS DE CACHE E LEITURA (ROBUSTEZ XLS/XLSX)
 # ==========================================
 @st.cache_data
-def extrair_saldo_balancete(file_bytes, conta_alvo):
+def extrair_saldo_balancete(raw_data, conta_alvo):
     try:
-        df_balancete = pd.read_excel(io.BytesIO(file_bytes))
+        df_balancete = pd.read_excel(io.BytesIO(raw_data))
     except:
         try:
-            dfs = pd.read_html(io.BytesIO(file_bytes).read())
+            dfs = pd.read_html(io.BytesIO(raw_data).read())
             df_balancete = dfs[0]
         except:
             raise ValueError("O formato do Balancete não é suportado ou o arquivo está corrompido.")
@@ -53,8 +53,8 @@ def extrair_saldo_balancete(file_bytes, conta_alvo):
     return formatar_moeda(linha_conta.iloc[0][col_saldo])
 
 @st.cache_data
-def carregar_base_lancamentos(file_bytes):
-    raw_data = file_bytes.read()
+def carregar_base_lancamentos(raw_data):
+    # CORREÇÃO APLICADA AQUI: raw_data já é bytes, não precisa de .read()
     try:
         df_raw = pd.read_excel(io.BytesIO(raw_data), header=None)
     except:
@@ -254,7 +254,7 @@ if arquivo_lancamentos and conta_input != 0:
             st.warning(f"**Aba 4 (Pendente)**\nSaldo: R$ {s_pend:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
         if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
-            st.success("✅ **Auditoria Validada:** As duas abas de itens conciliados fecharam em R$ 0,00 e o saldo de pendências bate rigorosamente com o Razão Total.")
+            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 e o saldo de pendências bate rigorosamente com o Razão Total.")
         
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
