@@ -205,84 +205,83 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     return nfs_abertas_reais, pags_orfaos_finais, pagos_antecipados, divergencia_juros, conciliados_exp, float(saldo_ant)
 
 def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
-    """Novo Motor: FIFO Atômico. Não desmembra vendas. Ou liquida 100% ou deixa 100% pendente."""
+    """FIFO em Lotes (Zero Desmembramento)"""
     df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
     
     vendas = df_alvo[df_alvo['Débito'] == conta_alvo].sort_values('Data').to_dict('records')
     recebimentos = df_alvo[df_alvo['Crédito'] == conta_alvo].sort_values('Data').to_dict('records')
     
+    # Insere o Saldo Anterior como a "Primeira Venda" a ser paga (ID 0)
     saldo_anterior = abs(Decimal(str(saldo_anterior_informado)))
-    idx_venda = 0
-    total_vendas = len(vendas)
-    
-    baixas_saldo_anterior = []
+    fila_dividas = []
+    if saldo_anterior > Decimal('0.00'):
+        fila_dividas.append({
+            'ID': 'Saldo_Ant', 'Data': 'Ano Anterior', 'Histórico': 'Dívida Acumulada do Passado',
+            'Valor': saldo_anterior, 'Status': 'Pendente'
+        })
+        
+    for v in vendas:
+        fila_dividas.append({
+            'ID': 'Venda_Nova', 'Data': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
+            'Valor': v['Valor'], 'Status': 'Pendente'
+        })
+
     pool_creditos = Decimal('0.00')
+    idx_divida = 0
+    total_dividas = len(fila_dividas)
+    
+    relatorio_lote = []
+    recebimentos_orfaos = []
 
     for rec in recebimentos:
-        credito_disponivel = rec['Valor']
+        credito_atual = rec['Valor']
+        pool_creditos += credito_atual
         
-        # 1. Barreira do Saldo Anterior (Prioridade)
-        if saldo_anterior > Decimal('0.00'):
-            if credito_disponivel >= saldo_anterior:
-                baixas_saldo_anterior.append({
-                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Histórico Bancário': rec['Histórico'],
-                    'Valor Recebido (Bruto)': float(rec['Valor']), 'Valor Retido p/ Saldo Anterior': float(saldo_anterior),
-                    'Motivo': 'Liquidou o restante do Saldo Anterior'
-                })
-                credito_disponivel -= saldo_anterior
-                saldo_anterior = Decimal('0.00')
-            else:
-                baixas_saldo_anterior.append({
-                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Histórico Bancário': rec['Histórico'],
-                    'Valor Recebido (Bruto)': float(rec['Valor']), 'Valor Retido p/ Saldo Anterior': float(credito_disponivel),
-                    'Motivo': 'Abatimento Parcial do Saldo Anterior'
-                })
-                saldo_anterior -= credito_disponivel
-                credito_disponivel = Decimal('0.00')
+        # Registra o recebimento inteiro, sem cortes, para o relatório
+        relatorio_lote.append({
+            'Tipo': 'RECEBIMENTO', 'Data': rec['Data'].strftime('%d/%m/%Y'),
+            'Histórico': rec['Histórico'], 'Valor': float(credito_atual)
+        })
+        
+        # Tenta pagar as dívidas na fila com o que tem no cofre
+        while idx_divida < total_dividas:
+            divida_atual = fila_dividas[idx_divida]
+            if pool_creditos >= divida_atual['Valor']:
+                pool_creditos -= divida_atual['Valor']
+                divida_atual['Status'] = 'Conciliado'
                 
-        # 2. O que sobra vai para o Cofre (Pool)
-        pool_creditos += credito_disponivel
-        
-        # 3. Motor Atômico: Só dá baixa se o cofre cobrir 100% da venda mais antiga
-        while idx_venda < total_vendas:
-            venda_atual = vendas[idx_venda]
-            valor_venda = venda_atual['Valor']
-            
-            if pool_creditos >= valor_venda:
-                pool_creditos -= valor_venda
-                venda_atual['Status'] = 'Conciliado'
-                idx_venda += 1
+                relatorio_lote.append({
+                    'Tipo': 'VENDA PAGA (BAIXA)', 'Data': divida_atual['Data'],
+                    'Histórico': divida_atual['Histórico'], 'Valor': float(divida_atual['Valor'])
+                })
+                idx_divida += 1
             else:
-                # O cofre não tem dinheiro suficiente. Para e espera o próximo recebimento, sem desmembrar.
-                break
+                break # Cofre não tem dinheiro para pagar a próxima venda inteira. Espera o próximo recebimento.
 
-    vendas_conciliadas = []
-    vendas_pendentes = []
-    
-    for v in vendas:
-        if v.get('Status') == 'Conciliado':
-            vendas_conciliadas.append({
-                'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
-                'Valor Original': float(v['Valor']), 'Motivo': 'Conciliado Integralmente'
-            })
-        else:
-            vendas_pendentes.append({
-                'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
-                'Valor Original': float(v['Valor']), 'Motivo': 'Pendente (Aguardando Recebimento Total)'
-            })
-
-    # Se sobrar dinheiro no cofre no fim do mês
-    recebimentos_orfaos = []
+    # Tudo que sobrou no cofre após tentar pagar as dívidas inteiras
     if pool_creditos > Decimal('0.00'):
         recebimentos_orfaos.append({
-            'Data Recebimento': 'Acumulado no Período', 'Valor Órfão': float(pool_creditos),
-            'Histórico': 'Saldo residual de créditos', 'Motivo': 'Créditos que sobraram após baixar vendas integrais'
+            'Data': 'Acumulado no Período', 'Valor Órfão': float(pool_creditos),
+            'Histórico': 'Saldo residual de recebimentos', 'Motivo': 'Cofre com crédito sobrando (Não pagou venda inteira)'
         })
+
+    vendas_pendentes = []
+    for d in fila_dividas:
+        if d['Status'] == 'Pendente' and d['ID'] == 'Venda_Nova':
+            vendas_pendentes.append({
+                'Data Venda': d['Data'], 'Histórico': d['Histórico'],
+                'Valor Original': float(d['Valor']), 'Motivo': 'Pendente (Aguardando Recebimento Total)'
+            })
 
     total_gerado = sum(v['Valor'] for v in vendas)
     total_pago = sum(r['Valor'] for r in recebimentos)
     
-    return float(total_gerado), float(total_pago), float(saldo_anterior), baixas_saldo_anterior, vendas_conciliadas, vendas_pendentes, recebimentos_orfaos, float(pool_creditos)
+    # Saldo Ant Pendente: Verifica se a primeira linha (ID Saldo_Ant) ainda está pendente
+    saldo_ant_pendente = 0.0
+    if len(fila_dividas) > 0 and fila_dividas[0]['ID'] == 'Saldo_Ant' and fila_dividas[0]['Status'] == 'Pendente':
+        saldo_ant_pendente = float(fila_dividas[0]['Valor'])
+    
+    return float(total_gerado), float(total_pago), float(saldo_anterior), relatorio_lote, vendas_pendentes, recebimentos_orfaos, float(pool_creditos), saldo_ant_pendente
 
 def gerar_excel_memoria(dfs_dict):
     output = io.BytesIO()
@@ -348,12 +347,11 @@ if arquivo_lancamentos and conta_input != 0:
                 st.error(f"Pagamentos Descasados: {len(pags)} registros")
                 
         else:
-            t_gerado, t_pago, saldo_ant_pendente, baixas_ant, v_conciliadas, v_pendentes, r_orfaos, pool_sobra = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
+            t_gerado, t_pago, saldo_ant_info, lote_conciliacao, v_pendentes, r_orfaos, pool_sobra, saldo_ant_pendente = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
-                'Baixas do Ano Anterior': baixas_ant, 
-                'Vendas Conciliadas': v_conciliadas, 
-                'Vendas Pendentes Integrais': v_pendentes, 
+                'Fluxo Caixa Conciliado': lote_conciliacao, 
+                'Vendas 100% Pendentes': v_pendentes, 
                 'Créditos Sobrando (Pool)': r_orfaos
             })
             
@@ -366,17 +364,16 @@ if arquivo_lancamentos and conta_input != 0:
             st.write(f"**Total Lançado (Novas Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             st.write(f"**Total Baixado (Créditos/Taxas):** R$ {t_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
-            # Cálculo Contábil Perfeito
             saldo_real_periodo = sum(item['Valor Original'] for item in v_pendentes)
             saldo_final_acumulado = saldo_ant_pendente + saldo_real_periodo - pool_sobra
             
             st.warning(f"**Saldo Residual a Receber (Cálculo Financeiro):** R$ {saldo_final_acumulado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
             st.write("---")
-            st.markdown("### Composição do Saldo (Sem Desmembramentos)")
+            st.markdown("### Composição do Saldo Final")
             st.error(f"🔹 **Vendas 100% Pendentes (Intactas):** R$ {saldo_real_periodo:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             if pool_sobra > 0:
-                st.success(f"🔹 **Créditos Sobrando (Não alocados - Abatem do total):** R$ {pool_sobra:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                st.success(f"🔹 **Créditos Sobrando (Não alocados - Abatem da dívida):** R$ {pool_sobra:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             if saldo_ant_pendente > 0:
                 st.info(f"🔹 **Saldo Anterior não liquidado:** R$ {saldo_ant_pendente:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
