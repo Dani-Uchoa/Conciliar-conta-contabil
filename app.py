@@ -205,86 +205,84 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     return nfs_abertas_reais, pags_orfaos_finais, pagos_antecipados, divergencia_juros, conciliados_exp, float(saldo_ant)
 
 def processar_cartoes_fifo(df_main, conta_alvo, saldo_anterior_informado):
+    """Novo Motor: FIFO Atômico. Não desmembra vendas. Ou liquida 100% ou deixa 100% pendente."""
     df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
     
     vendas = df_alvo[df_alvo['Débito'] == conta_alvo].sort_values('Data').to_dict('records')
     recebimentos = df_alvo[df_alvo['Crédito'] == conta_alvo].sort_values('Data').to_dict('records')
     
-    for v in vendas:
-        v['Saldo_Pendente'] = v['Valor']
-
     saldo_anterior = abs(Decimal(str(saldo_anterior_informado)))
     idx_venda = 0
     total_vendas = len(vendas)
     
-    # LISTAS DE RASTREAMENTO
     baixas_saldo_anterior = []
-    recebimentos_orfaos = []
+    pool_creditos = Decimal('0.00')
 
     for rec in recebimentos:
         credito_disponivel = rec['Valor']
         
-        # 1. Barreira do Saldo Anterior (Agora rastreada e documentada)
+        # 1. Barreira do Saldo Anterior (Prioridade)
         if saldo_anterior > Decimal('0.00'):
             if credito_disponivel >= saldo_anterior:
                 baixas_saldo_anterior.append({
-                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'),
-                    'Histórico Bancário': rec['Histórico'],
-                    'Valor Recebido (Bruto)': float(rec['Valor']),
-                    'Valor Retido p/ Saldo Anterior': float(saldo_anterior),
+                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Histórico Bancário': rec['Histórico'],
+                    'Valor Recebido (Bruto)': float(rec['Valor']), 'Valor Retido p/ Saldo Anterior': float(saldo_anterior),
                     'Motivo': 'Liquidou o restante do Saldo Anterior'
                 })
                 credito_disponivel -= saldo_anterior
                 saldo_anterior = Decimal('0.00')
             else:
                 baixas_saldo_anterior.append({
-                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'),
-                    'Histórico Bancário': rec['Histórico'],
-                    'Valor Recebido (Bruto)': float(rec['Valor']),
-                    'Valor Retido p/ Saldo Anterior': float(credito_disponivel),
+                    'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Histórico Bancário': rec['Histórico'],
+                    'Valor Recebido (Bruto)': float(rec['Valor']), 'Valor Retido p/ Saldo Anterior': float(credito_disponivel),
                     'Motivo': 'Abatimento Parcial do Saldo Anterior'
                 })
                 saldo_anterior -= credito_disponivel
                 credito_disponivel = Decimal('0.00')
                 
-        # 2. Motor FIFO de Vendas Vigentes
-        while credito_disponivel > Decimal('0.00') and idx_venda < total_vendas:
+        # 2. O que sobra vai para o Cofre (Pool)
+        pool_creditos += credito_disponivel
+        
+        # 3. Motor Atômico: Só dá baixa se o cofre cobrir 100% da venda mais antiga
+        while idx_venda < total_vendas:
             venda_atual = vendas[idx_venda]
-            if venda_atual['Saldo_Pendente'] <= credito_disponivel:
-                credito_disponivel -= venda_atual['Saldo_Pendente']
-                venda_atual['Saldo_Pendente'] = Decimal('0.00')
+            valor_venda = venda_atual['Valor']
+            
+            if pool_creditos >= valor_venda:
+                pool_creditos -= valor_venda
+                venda_atual['Status'] = 'Conciliado'
                 idx_venda += 1
             else:
-                venda_atual['Saldo_Pendente'] -= credito_disponivel
-                credito_disponivel = Decimal('0.00')
-                
-        # 3. Sobras reais
-        if credito_disponivel > Decimal('0.00') and idx_venda >= total_vendas:
-            recebimentos_orfaos.append({
-                'Data Recebimento': rec['Data'].strftime('%d/%m/%Y'), 'Valor Órfão': float(credito_disponivel),
-                'Histórico': rec['Histórico'], 'Motivo': 'Recebimento sem Venda (Possível Antecipação ou Erro)'
-            })
+                # O cofre não tem dinheiro suficiente. Para e espera o próximo recebimento, sem desmembrar.
+                break
 
     vendas_conciliadas = []
     vendas_pendentes = []
     
     for v in vendas:
-        if v['Saldo_Pendente'] == Decimal('0.00'):
+        if v.get('Status') == 'Conciliado':
             vendas_conciliadas.append({
                 'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
-                'Valor Original': float(v['Valor']), 'Motivo': 'Conciliado (Baixa FIFO 100%)'
+                'Valor Original': float(v['Valor']), 'Motivo': 'Conciliado Integralmente'
             })
         else:
-            motivo = 'Parcialmente Conciliado (Aguardando Restante)' if v['Saldo_Pendente'] < v['Valor'] else 'Não Conciliado (Saldo Intacto)'
             vendas_pendentes.append({
                 'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
-                'Valor Original': float(v['Valor']), 'Saldo Pendente': float(v['Saldo_Pendente']), 'Motivo': motivo
+                'Valor Original': float(v['Valor']), 'Motivo': 'Pendente (Aguardando Recebimento Total)'
             })
+
+    # Se sobrar dinheiro no cofre no fim do mês
+    recebimentos_orfaos = []
+    if pool_creditos > Decimal('0.00'):
+        recebimentos_orfaos.append({
+            'Data Recebimento': 'Acumulado no Período', 'Valor Órfão': float(pool_creditos),
+            'Histórico': 'Saldo residual de créditos', 'Motivo': 'Créditos que sobraram após baixar vendas integrais'
+        })
 
     total_gerado = sum(v['Valor'] for v in vendas)
     total_pago = sum(r['Valor'] for r in recebimentos)
     
-    return float(total_gerado), float(total_pago), float(saldo_anterior), baixas_saldo_anterior, vendas_conciliadas, vendas_pendentes, recebimentos_orfaos
+    return float(total_gerado), float(total_pago), float(saldo_anterior), baixas_saldo_anterior, vendas_conciliadas, vendas_pendentes, recebimentos_orfaos, float(pool_creditos)
 
 def gerar_excel_memoria(dfs_dict):
     output = io.BytesIO()
@@ -297,10 +295,10 @@ def gerar_excel_memoria(dfs_dict):
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
 st.title("Auditoria Contábil - Domínio Sistemas")
-st.markdown("Identificação analítica em base geral. Os arquivos em lote são mantidos em cache para processamento instantâneo.")
+st.markdown("Identificação analítica em base geral. Arquivos mantidos em cache para processamento instantâneo.")
 
 modo = st.radio("Selecione o Modelo de Regra de Negócio:", 
-                ["1. Fornecedores (Cruzamento Exato e Agrupado)", "2. Cartões / Contas sem ID (Baixa FIFO)"])
+                ["1. Fornecedores (Cruzamento Exato e Agrupado)", "2. Cartões / Contas sem ID (FIFO Atômico Sem Desmembramento)"])
 
 conta_input = st.number_input("Digite a conta contábil alvo (Ex: 1059 ou 808)", value=0, step=1)
 
@@ -328,7 +326,6 @@ elif not arquivo_balancete:
 if arquivo_lancamentos and conta_input != 0:
     try:
         st.info("Processando base de dados em cache...")
-        
         bytes_lancamentos = arquivo_lancamentos.getvalue()
         df_base_geral = carregar_base_lancamentos(bytes_lancamentos)
         
@@ -351,13 +348,13 @@ if arquivo_lancamentos and conta_input != 0:
                 st.error(f"Pagamentos Descasados: {len(pags)} registros")
                 
         else:
-            t_gerado, t_pago, saldo_ant_pendente, baixas_ant, v_conciliadas, v_pendentes, r_orfaos = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
+            t_gerado, t_pago, saldo_ant_pendente, baixas_ant, v_conciliadas, v_pendentes, r_orfaos, pool_sobra = processar_cartoes_fifo(df_base_geral, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
-                'Baixas do Ano Anterior': baixas_ant, # <--- ABA NOVA CRIADA AQUI
+                'Baixas do Ano Anterior': baixas_ant, 
                 'Vendas Conciliadas': v_conciliadas, 
-                'Vendas Pendentes': v_pendentes, 
-                'Créditos Órfãos': r_orfaos
+                'Vendas Pendentes Integrais': v_pendentes, 
+                'Créditos Sobrando (Pool)': r_orfaos
             })
             
             st.download_button(label="📥 Baixar Relatório (Cartões)", data=excel_data, 
@@ -369,10 +366,19 @@ if arquivo_lancamentos and conta_input != 0:
             st.write(f"**Total Lançado (Novas Vendas):** R$ {t_gerado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             st.write(f"**Total Baixado (Créditos/Taxas):** R$ {t_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
-            saldo_real_periodo = sum(item['Saldo Pendente'] for item in v_pendentes)
-            saldo_final_acumulado = saldo_ant_pendente + saldo_real_periodo
+            # Cálculo Contábil Perfeito
+            saldo_real_periodo = sum(item['Valor Original'] for item in v_pendentes)
+            saldo_final_acumulado = saldo_ant_pendente + saldo_real_periodo - pool_sobra
             
-            st.warning(f"**Saldo Residual a Receber (Novo Acumulado):** R$ {saldo_final_acumulado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.warning(f"**Saldo Residual a Receber (Cálculo Financeiro):** R$ {saldo_final_acumulado:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
+            st.write("---")
+            st.markdown("### Composição do Saldo (Sem Desmembramentos)")
+            st.error(f"🔹 **Vendas 100% Pendentes (Intactas):** R$ {saldo_real_periodo:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            if pool_sobra > 0:
+                st.success(f"🔹 **Créditos Sobrando (Não alocados - Abatem do total):** R$ {pool_sobra:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            if saldo_ant_pendente > 0:
+                st.info(f"🔹 **Saldo Anterior não liquidado:** R$ {saldo_ant_pendente:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
             
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
