@@ -15,7 +15,7 @@ def formatar_moeda(v):
         return Decimal('0.00')
 
 # ==========================================
-# MÓDULOS DE CACHE E LEITURA 
+# MÓDULOS DE CACHE E LEITURA (ROBUSTEZ XLS/XLSX)
 # ==========================================
 @st.cache_data
 def extrair_saldo_balancete(raw_data, conta_alvo):
@@ -26,7 +26,7 @@ def extrair_saldo_balancete(raw_data, conta_alvo):
             dfs = pd.read_html(io.BytesIO(raw_data).read())
             df_balancete = dfs[0]
         except:
-            raise ValueError("O formato do Balancete não é suportado ou o arquivo está corrompido.")
+            raise ValueError("O formato do Balancete não é suportado ou está corrompido.")
 
     cols_str = ' '.join(str(c).upper() for c in df_balancete.columns)
     
@@ -62,7 +62,7 @@ def carregar_base_lancamentos(raw_data):
             dfs = pd.read_html(io.BytesIO(raw_data))
             df_raw = dfs[0]
         except:
-            raise ValueError("Erro de leitura. Certifique-se de que é um Excel válido.")
+            raise ValueError("Erro de leitura. Certifique-se de que é um Excel (.xlsx ou .xls) válido.")
 
     header_idx = 5
     for idx, row in df_raw.head(20).iterrows():
@@ -91,7 +91,7 @@ def carregar_base_lancamentos(raw_data):
     return df_main
 
 # ==========================================
-# MOTOR ORIGINAL DE INTERSEÇÃO (O QUE DEU CERTO) + 4 RAZÕES
+# MOTOR DOS 4 RAZÕES (MATCHING PROGRESSIVO AVANÇADO)
 # ==========================================
 def montar_tabela_razao(eventos):
     razao = []
@@ -123,93 +123,116 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     if saldo_ant > Decimal('0.00'):
         data_base = df_alvo['Data'].min() if not df_alvo.empty else pd.to_datetime('2026-01-01')
         todos_debitos.append({
-            'Data Real': data_base - pd.Timedelta(days=1), 'Data': 'Saldo Anterior',
+            'Data Real': (data_base - pd.Timedelta(days=1)).strftime('%d/%m/%Y'), 'Data': 'Saldo Anterior',
             'Histórico': 'SALDO ANTERIOR HERDADO', 'Débito': saldo_ant, 'Crédito': Decimal('0.00')
         })
 
     for idx, row in df_alvo.iterrows():
-        dt_real = row['Data']
-        dt_str = dt_real.strftime('%d/%m/%Y')
+        dt_str = row['Data'].strftime('%d/%m/%Y')
         valor = Decimal(str(row['Valor']))
         if row[col_deb] == conta_alvo:
-            todos_debitos.append({'Data Real': dt_real, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': valor, 'Crédito': Decimal('0.00')})
+            todos_debitos.append({'Data Real': dt_str, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': valor, 'Crédito': Decimal('0.00')})
         if row[col_cred] == conta_alvo:
-            todos_creditos.append({'Data Real': dt_real, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': Decimal('0.00'), 'Crédito': valor})
+            todos_creditos.append({'Data Real': dt_str, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': Decimal('0.00'), 'Crédito': valor})
 
-    todos_debitos.sort(key=lambda x: x['Data Real'])
-    todos_creditos.sort(key=lambda x: x['Data Real'])
+    todos_debitos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
+    todos_creditos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
 
-    # O MOTOR QUE FUNCIONOU: ACUMULADORES INDEPENDENTES
+    # Matrizes Acumuladas
     d_cum = [sum(d['Débito'] for d in todos_debitos[:i+1]) for i in range(len(todos_debitos))]
     c_cum = [sum(c['Crédito'] for c in todos_creditos[:i+1]) for i in range(len(todos_creditos))]
     
-    intersecoes = sorted(list(set(d_cum).intersection(set(c_cum))))
+    matches = []
     
+    # BUSCA PROGRESSIVA (De frente para trás)
+    for i in range(len(d_cum)):
+        target = d_cum[i]
+        
+        # 1. Interseção Perfeita
+        try:
+            j = c_cum.index(target)
+            matches.append((i, list(range(j+1))))
+            continue
+        except ValueError:
+            pass
+            
+        # Ponto de partida
+        start_j = -1
+        for j in range(len(c_cum)):
+            if c_cum[j] > target:
+                start_j = j
+                break
+        
+        if start_j == -1: continue
+            
+        found = False
+        # 2. Omissão de 1 Registro (Drop 1)
+        for j in range(start_j, len(c_cum)):
+            diff = c_cum[j] - target
+            subset = todos_creditos[:j+1]
+            for drop in range(j+1):
+                if subset[drop]['Crédito'] == diff:
+                    matches.append((i, [k for k in range(j+1) if k != drop]))
+                    found = True
+                    break
+            if found: break
+            
+        if found: continue
+        
+        # 3. Omissão de 2 Registros (Algoritmo Rápido Hash)
+        found = False
+        for j in range(start_j, min(len(c_cum), start_j + 60)):
+            diff = c_cum[j] - target
+            subset = todos_creditos[:j+1]
+            seen = {}
+            for drop_idx, item in enumerate(subset):
+                val = item['Crédito']
+                needed = diff - val
+                if needed in seen:
+                    matches.append((i, [k for k in range(j+1) if k != drop_idx and k != seen[needed]]))
+                    found = True
+                    break
+                seen[val] = drop_idx
+            if found: break
+
+    # SEPARAÇÃO CRÍTICA (ANO ANTERIOR VS ATUAL)
     d_ant, c_ant = [], []
     d_atual, c_atual = [], []
-    d_pend = todos_debitos.copy()
-    c_pend = todos_creditos.copy()
-
-    if intersecoes:
-        # Pega a primeira interseção (Corte do Ano Anterior) e a Última (Corte do Atual)
-        primeira_intersecao = intersecoes[0]
-        max_intersecao = intersecoes[-1]
+    
+    if matches:
+        # Pega a PRIMEIRA interseção para o Ano Anterior e a ÚLTIMA para o Atual
+        primeiro_match = matches[0]
+        ultimo_match = matches[-1]
         
-        idx_d_primeira = d_cum.index(primeira_intersecao)
-        idx_c_primeira = c_cum.index(primeira_intersecao)
+        idx_d_prim = primeiro_match[0]
+        idx_c_prim = primeiro_match[1]
         
-        idx_d_max = d_cum.index(max_intersecao)
-        idx_c_max = c_cum.index(max_intersecao)
+        idx_d_ult = ultimo_match[0]
+        idx_c_ult = ultimo_match[1]
         
         if saldo_ant > Decimal('0.00'):
-            # Até a primeira interseção vai para o Razão Ano Anterior
-            d_ant = todos_debitos[:idx_d_primeira+1]
-            c_ant = todos_creditos[:idx_c_primeira+1]
+            d_ant = todos_debitos[:idx_d_prim+1]
+            c_ant = [todos_creditos[k] for k in idx_c_prim]
             
-            # O restante do que bateu vai para o Razão Atual
-            d_atual = todos_debitos[idx_d_primeira+1 : idx_d_max+1]
-            c_atual = todos_creditos[idx_c_primeira+1 : idx_c_max+1]
+            if idx_d_ult > idx_d_prim:
+                d_atual = todos_debitos[idx_d_prim+1 : idx_d_ult+1]
+                c_atual = [todos_creditos[k] for k in idx_c_ult if k not in idx_c_prim]
         else:
-            # Sem saldo velho, tudo que concilia vai para o Razão Atual
-            d_atual = todos_debitos[:idx_d_max+1]
-            c_atual = todos_creditos[:idx_c_max+1]
+            d_atual = todos_debitos[:idx_d_ult+1]
+            c_atual = [todos_creditos[k] for k in idx_c_ult]
             
-        # O que ficou de fora das interseções vai para o Razão Pendências
-        d_pend = todos_debitos[idx_d_max+1:]
-        c_pend = todos_creditos[idx_c_max+1:]
+        d_pend = todos_debitos[idx_d_ult+1:]
+        c_pend = [todos_creditos[k] for k in range(len(todos_creditos)) if k not in idx_c_ult]
         
     else:
-        # Fallback caso haja taxas não mapeadas (Omissão) - idêntico à versão de 3 abas
-        match_encontrado = False
-        for i in range(len(d_cum)-1, -1, -1):
-            if match_encontrado: break
-            target = d_cum[i]
-            for j in range(len(c_cum)):
-                if c_cum[j] >= target:
-                    subset_c = todos_creditos[:j+1]
-                    for drop in itertools.combinations(range(len(subset_c)), 1):
-                        if c_cum[j] - sum(subset_c[k]['Crédito'] for k in drop) == target:
-                            c_conciliados = [subset_c[k] for k in range(len(subset_c)) if k not in drop]
-                            d_conciliados = todos_debitos[:i+1]
-                            
-                            if saldo_ant > Decimal('0.00'):
-                                d_ant = d_conciliados
-                                c_ant = c_conciliados
-                            else:
-                                d_atual = d_conciliados
-                                c_atual = c_conciliados
-                                
-                            d_pend = todos_debitos[i+1:]
-                            c_pend = [todos_creditos[k] for k in range(len(todos_creditos)) if k not in range(j+1) or k in drop]
-                            match_encontrado = True
-                            break
-                    if match_encontrado: break
+        d_pend = todos_debitos.copy()
+        c_pend = todos_creditos.copy()
 
     # Ordenação e Montagem das Tabelas
-    todos_eventos = sorted(todos_debitos + todos_creditos, key=lambda x: (x['Data Real'], x['Crédito'] > 0))
-    eventos_ant = sorted(d_ant + c_ant, key=lambda x: (x['Data Real'], x['Crédito'] > 0))
-    eventos_atual = sorted(d_atual + c_atual, key=lambda x: (x['Data Real'], x['Crédito'] > 0))
-    eventos_pend = sorted(d_pend + c_pend, key=lambda x: (x['Data Real'], x['Crédito'] > 0))
+    todos_eventos = sorted(todos_debitos + todos_creditos, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
+    eventos_ant = sorted(d_ant + c_ant, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
+    eventos_atual = sorted(d_atual + c_atual, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
+    eventos_pend = sorted(d_pend + c_pend, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
 
     razao_tot, saldo_tot = montar_tabela_razao(todos_eventos)
     razao_ant, saldo_ant_aba = montar_tabela_razao(eventos_ant)
@@ -229,7 +252,7 @@ def gerar_excel_memoria(dfs_dict):
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
 st.title("Auditoria Contábil - Domínio Sistemas")
-st.markdown("Emissão Analítica de Livros Razão. Separação de Exercícios.")
+st.markdown("Emissão Analítica de Livros Razão. Separação Estrita de Exercícios.")
 
 modo = st.radio("Selecione a Natureza da Conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
 conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
@@ -262,7 +285,7 @@ if arquivo_lancamentos and conta_input != 0:
         # VALIDAÇÃO BLOQUEANTE DA CONTA
         tem_na_base = (df_base_geral['Débito'] == conta_input).any() or (df_base_geral['Crédito'] == conta_input).any()
         if not tem_na_base:
-            st.error(f"❌ EXECUÇÃO BLOQUEADA: A conta {conta_input} não possui lançamentos no arquivo anexado.")
+            st.error(f"❌ EXECUÇÃO BLOQUEADA: A conta {conta_input} não possui lançamentos no arquivo anexado. Digite o número correto.")
             st.stop()
             
         tipo_auditoria = 'CARTAO' if 'Cartões' in modo else 'FORNECEDOR'
@@ -273,7 +296,7 @@ if arquivo_lancamentos and conta_input != 0:
         
         # VALIDAÇÃO DE CONCILIAÇÃO (ALERTA VERMELHO)
         if len(r_ant) == 0 and len(r_atual) == 0:
-            st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos exatos.")
+            st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos exatos na base enviada.")
         
         excel_data = gerar_excel_memoria({
             '1. Razão Total': r_tot,
@@ -300,7 +323,7 @@ if arquivo_lancamentos and conta_input != 0:
             st.warning(f"**Aba 4 (Pend)**\nR$ {s_pend:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
         if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
-            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 perfeitamente.")
+            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 e o saldo bate com o Razão Total.")
         
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
