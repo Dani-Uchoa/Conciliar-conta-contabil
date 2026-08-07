@@ -171,52 +171,67 @@ def processar_fornecedores(df_main, conta_alvo, saldo_anterior_informado):
     return nfs_abertas_reais, pags_orfaos_finais, pagos_antecipados, conciliados_exp, float(saldo_ant)
 
 def processar_cartoes_extrato(df_main, conta_alvo, saldo_anterior_informado):
-    """Módulo Reconstruído: Foco no Extrato Contábil Universal (Razão)"""
     df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
     
     vendas = df_alvo[df_alvo['Débito'] == conta_alvo].to_dict('records')
     recebimentos = df_alvo[df_alvo['Crédito'] == conta_alvo].to_dict('records')
     
     movimentacao_completa = vendas + recebimentos
-    movimentacao_completa.sort(key=lambda x: x['Data']) # Ordenação rigorosamente cronológica
+    movimentacao_completa.sort(key=lambda x: x['Data'])
     
     saldo_anterior = abs(Decimal(str(saldo_anterior_informado)))
     
     extrato_razao = []
-    # Linha 1: O Ponto de Partida
     extrato_razao.append({
         'Data': '01/01/2026', 
         'Histórico': 'SALDO ANTERIOR (HERDADO)', 
         'Vendas Lançadas (Débito)': None, 
         'Recebimentos/Taxas (Crédito)': None, 
+        'Classificação do Lançamento': 'Origem da Dívida',
         'Saldo Acumulado a Receber': float(saldo_anterior)
     })
     
     saldo_atual = saldo_anterior
+    pendencia_ano_anterior = saldo_anterior
     
     for mov in movimentacao_completa:
         valor_str = mov['Valor']
         
-        if mov['Débito'] == conta_alvo: # Venda (Aumenta o direito a receber)
+        if mov['Débito'] == conta_alvo: # Nova Venda
             saldo_atual += valor_str
             extrato_razao.append({
                 'Data': mov['Data'].strftime('%d/%m/%Y'),
                 'Histórico': mov['Histórico'],
                 'Vendas Lançadas (Débito)': float(valor_str),
                 'Recebimentos/Taxas (Crédito)': None,
+                'Classificação do Lançamento': 'Nova Venda',
                 'Saldo Acumulado a Receber': float(saldo_atual)
             })
-        else: # Recebimento ou Taxa (Diminui o que tem a receber)
+        else: # Recebimento/Taxa
             saldo_atual -= valor_str
+            classificacao = ""
+            
+            # Rastreador de Destino do Crédito (Identifica o Saldo Anterior)
+            if pendencia_ano_anterior > Decimal('0.00'):
+                if valor_str <= pendencia_ano_anterior:
+                    classificacao = "Liquida Saldo Anterior (Não Conciliar na Domínio)"
+                    pendencia_ano_anterior -= valor_str
+                else:
+                    classificacao = f"Misto (R$ {pendencia_ano_anterior} pro Anterior / Resto p/ Venda Nova)"
+                    pendencia_ano_anterior = Decimal('0.00')
+            else:
+                classificacao = "Liquida Vendas Atuais"
+                
             extrato_razao.append({
                 'Data': mov['Data'].strftime('%d/%m/%Y'),
                 'Histórico': mov['Histórico'],
                 'Vendas Lançadas (Débito)': None,
                 'Recebimentos/Taxas (Crédito)': float(valor_str),
+                'Classificação do Lançamento': classificacao,
                 'Saldo Acumulado a Receber': float(saldo_atual)
             })
 
-    # FIFO Atômico para classificar as vendas apenas
+    # Motor FIFO Atômico
     idx_venda = 0
     pool_creditos = Decimal('0.00')
     saldo_fifo = saldo_anterior
@@ -244,8 +259,17 @@ def processar_cartoes_extrato(df_main, conta_alvo, saldo_anterior_informado):
         'Data Venda': v['Data'].strftime('%d/%m/%Y'), 'Histórico': v['Histórico'],
         'Valor': float(v['Valor']), 'Status FIFO': v['Status']
     } for v in vendas]
+    
+    # Adiciona a linha de dedução dos créditos que sobraram
+    if pool_creditos > Decimal('0.00'):
+        vendas_listagem.append({
+            'Data Venda': '---',
+            'Histórico': '(-) CRÉDITOS LIVRES NA CONTA (Aguardando próxima venda)',
+            'Valor': float(-pool_creditos),
+            'Status FIFO': 'Abate o valor a receber'
+        })
 
-    return extrato_razao, vendas_listagem, float(saldo_atual)
+    return extrato_razao, vendas_listagem, float(saldo_atual), float(pool_creditos)
 
 def gerar_excel_memoria(dfs_dict):
     output = io.BytesIO()
@@ -294,12 +318,11 @@ if arquivo_lancamentos and conta_input != 0:
         
         if "1. Fornecedores" in modo:
             nfs, pags, antecipados, conciliados, saldo_ant_restante = processar_fornecedores(df_base_geral, conta_input, saldo_abertura_var)
-            
             excel_data = gerar_excel_memoria({'Conciliados': conciliados, 'NFs Abertas': nfs, 'Pagamentos (Sobra)': pags})
             st.download_button(label="📥 Baixar Relatório (Fornecedores)", data=excel_data, 
                                file_name=f"Auditoria_Fornecedor_{conta_input}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            extrato, vendas_list, saldo_final = processar_cartoes_extrato(df_base_geral, conta_input, saldo_abertura_var)
+            extrato, vendas_list, saldo_final, creditos_livres = processar_cartoes_extrato(df_base_geral, conta_input, saldo_abertura_var)
             
             excel_data = gerar_excel_memoria({
                 'Extrato Conta Corrente (Razão)': extrato, 
@@ -313,7 +336,8 @@ if arquivo_lancamentos and conta_input != 0:
             st.write("---")
             st.subheader("Balanço Sintético do Período")
             st.warning(f"**Saldo Residual Final a Receber:** R$ {saldo_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-            st.info("💡 **Aba 1 (Extrato):** Mostra dia a dia os recebimentos abatendo a dívida total, sem desmembrar PIX.\n\n💡 **Aba 2 (Vendas):** Mostra quais vendas novas o sistema considerou pagas após liquidar o passado.")
+            if creditos_livres > 0:
+                st.info(f"*(Inclui R$ {creditos_livres:,.2f} de créditos retidos na conta)*".replace(",", "X").replace(".", ",").replace("X", "."))
             
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
