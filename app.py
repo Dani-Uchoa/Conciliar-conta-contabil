@@ -3,85 +3,7 @@ import pandas as pd
 import io
 from decimal import Decimal, ROUND_HALF_UP
 
-st.set_page_config(
-    page_title="Auditoria Contábil - Domínio Sistemas",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# ==========================================
-# CSS CUSTOMIZADO (VISUAL)
-# ==========================================
-st.markdown("""
-<style>
-    /* Métricas maiores e com mais peso */
-    [data-testid="stMetricValue"] {
-        font-size: 26px;
-        font-weight: 700;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 13px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        opacity: 0.75;
-    }
-    [data-testid="stMetric"] {
-        background-color: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 12px;
-        padding: 16px 18px;
-    }
-
-    /* Cabeçalho principal */
-    .app-header {
-        padding: 18px 24px;
-        background: linear-gradient(135deg, #2E86AB 0%, #1A5276 100%);
-        border-radius: 14px;
-        margin-bottom: 22px;
-    }
-    .app-header h1 {
-        color: white;
-        font-size: 26px;
-        margin: 0;
-    }
-    .app-header p {
-        color: #DCE9F4;
-        margin: 4px 0 0 0;
-        font-size: 14px;
-    }
-
-    /* Cards de upload */
-    div[data-testid="stFileUploader"] {
-        border: 1.5px dashed #B8C4D0;
-        border-radius: 10px;
-        padding: 6px;
-        background-color: #FAFBFC;
-    }
-
-    /* Botão de download em destaque */
-    div[data-testid="stDownloadButton"] button {
-        background-color: #2E86AB;
-        color: white;
-        font-weight: 600;
-        border-radius: 8px;
-        border: none;
-        padding: 10px 20px;
-    }
-    div[data-testid="stDownloadButton"] button:hover {
-        background-color: #1A5276;
-    }
-
-    /* Abas mais espaçadas */
-    button[data-baseweb="tab"] {
-        font-weight: 600;
-        font-size: 14px;
-    }
-
-    hr { margin: 1.2rem 0; }
-</style>
-""", unsafe_allow_html=True)
-
+st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
 
 def formatar_moeda(v):
     try:
@@ -319,30 +241,18 @@ def gerar_excel_memoria(dfs_dict):
 # ==========================================
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
-st.markdown("""
-<div class="app-header">
-    <h1>📊 Auditoria Contábil — Domínio Sistemas</h1>
-    <p>Emissão analítica de livros Razão · Motor de conciliação por hash de alta performance</p>
-</div>
-""", unsafe_allow_html=True)
+st.title("📊 Auditoria Contábil - Domínio Sistemas")
+st.markdown("Emissão Analítica de Livros Razão. Motor de Hash de Alta Performance.")
 
-col_config1, col_config2 = st.columns([1.4, 1])
-with col_config1:
-    modo = st.radio(
-        "Natureza da conta",
-        ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"],
-        horizontal=True
-    )
-with col_config2:
-    conta_input = st.number_input("Conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
+modo = st.radio("Selecione a Natureza da Conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
+conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
 
 st.markdown("---")
-
 col_arq1, col_arq2 = st.columns(2)
 with col_arq1:
-    arquivo_lancamentos = st.file_uploader("📁 Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
+    arquivo_lancamentos = st.file_uploader("📁 Anexe a Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
 with col_arq2:
-    arquivo_balancete = st.file_uploader("📁 Balancete (opcional) (.xls ou .xlsx)", type=["xls", "xlsx"])
+    arquivo_balancete = st.file_uploader("📁 Anexe o Balancete Opcional (.xls ou .xlsx)", type=["xls", "xlsx"])
 
 saldo_abertura_var = Decimal('0.00')
 
@@ -355,7 +265,7 @@ if arquivo_balancete and conta_input != 0:
         st.error("Erro ao analisar o Balancete. Verifique o formato do arquivo.")
         saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00)))
 elif not arquivo_balancete:
-    saldo_abertura_var = Decimal(str(st.number_input("Saldo Anterior Manual (R$)", value=0.00, step=100.00)))
+    saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00, step=100.00)))
 
 if arquivo_lancamentos and conta_input != 0:
     try:
@@ -383,9 +293,12 @@ if arquivo_lancamentos and conta_input != 0:
             '4. Não Conciliado (Pendente)': r_pend
         })
 
-        st.markdown("---")
-        st.subheader("Resultado da Auditoria")
+        st.download_button(label="📥 Baixar 4 Razões (Excel)", data=excel_data,
+                           file_name=f"Auditoria_4Razoes_{conta_input}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        st.write("---")
+        st.subheader("Balanço de Validação das Abas")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("📘 Total", formatar_brl(s_tot))
         col2.metric("✅ Conciliado (Ant)", formatar_brl(s_ant))
@@ -394,26 +307,6 @@ if arquivo_lancamentos and conta_input != 0:
 
         if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
             st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 perfeitamente.")
-
-        st.download_button(
-            label="📥 Baixar 4 Razões (Excel)",
-            data=excel_data,
-            file_name=f"Auditoria_4Razoes_{conta_input}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-        st.markdown("---")
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📘 Razão Total", "✅ Conciliado (Ant.)", "✅ Conciliado (Atual)", "⚠️ Pendente"
-        ])
-        with tab1:
-            st.dataframe(pd.DataFrame(r_tot), use_container_width=True, hide_index=True)
-        with tab2:
-            st.dataframe(pd.DataFrame(r_ant), use_container_width=True, hide_index=True)
-        with tab3:
-            st.dataframe(pd.DataFrame(r_atual), use_container_width=True, hide_index=True)
-        with tab4:
-            st.dataframe(pd.DataFrame(r_pend), use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
