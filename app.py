@@ -27,6 +27,38 @@ def extrair_saldo_balancete(raw_data, conta_alvo):
     try:
         df_balancete = pd.read_excel(io.BytesIO(raw_data))
     except:
+        tryimport streamlit as st
+import pandas as pd
+import io
+import re
+from decimal import Decimal, ROUND_HALF_UP
+from collections import defaultdict, deque
+from itertools import combinations
+
+st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
+
+def formatar_moeda(v):
+    try:
+        if isinstance(v, str):
+            v = v.replace('.', '').replace(',', '.')
+        return Decimal(str(v)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except:
+        return Decimal('0.00')
+
+
+def formatar_brl(valor):
+    """Formata número float/Decimal para R$ 1.234,56"""
+    return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# ==========================================
+# MÓDULOS DE CACHE E LEITURA (ROBUSTEZ)
+# ==========================================
+@st.cache_data
+def extrair_saldo_balancete(raw_data, conta_alvo):
+    try:
+        df_balancete = pd.read_excel(io.BytesIO(raw_data))
+    except:
         try:
             dfs = pd.read_html(io.BytesIO(raw_data).read())
             df_balancete = dfs[0]
@@ -103,7 +135,9 @@ def carregar_base_lancamentos(raw_data):
 
 
 # ==========================================
-# MOTOR HASH MAP (ALTA PERFORMANCE) E 4 RAZÕES
+# MOTOR DE CONCILIAÇÃO (v5)
+# Etapa 1: saldo anterior | Etapa 2: direto 1:1 | Etapa 3: grupo por NF-e (seguro)
+# Etapa 4: grupo por janela curta - opcional, para casos sem identificador (cartão)
 # ==========================================
 def montar_tabela_razao(eventos):
     razao = []
@@ -121,7 +155,162 @@ def montar_tabela_razao(eventos):
     return razao, float(saldo)
 
 
-def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, tipo):
+def _fechar_saldo_anterior(saldo_ant, creditos):
+    """Fecha o saldo anterior (débito único) contra uma combinação de créditos em
+    sequência cuja soma bata exatamente, permitindo 1 crédito 'fora da ordem'."""
+    if saldo_ant <= 0 or not creditos:
+        return []
+    acumulado = Decimal('0.00')
+    indices = []
+    for idx, c in enumerate(creditos):
+        acumulado += c['Crédito']
+        indices.append(idx)
+        if acumulado == saldo_ant:
+            return indices
+        if acumulado > saldo_ant:
+            diff = acumulado - saldo_ant
+            for ci in indices:
+                if creditos[ci]['Crédito'] == diff:
+                    return [i for i in indices if i != ci]
+            return []
+    return []
+
+
+def _matching_direto(debitos_idx, creditos_idx, todos_debitos, todos_creditos):
+    """Casa 1 débito com 1 crédito de valor EXATAMENTE igual (fila FIFO por valor)."""
+    fila_por_valor = defaultdict(deque)
+    for i in creditos_idx:
+        fila_por_valor[todos_creditos[i]['Crédito']].append(i)
+
+    debitos_usados = set()
+    creditos_usados = set()
+    for i in debitos_idx:
+        valor = todos_debitos[i]['Débito']
+        fila = fila_por_valor.get(valor)
+        if fila:
+            j = fila.popleft()
+            debitos_usados.add(i)
+            creditos_usados.add(j)
+
+    return debitos_usados, creditos_usados
+
+
+def _extrair_chave_documento(historico):
+    """Extrai o número da NF-e do histórico (ex: 'NF-e 613432' -> '613432')."""
+    m = re.search(r'NF-?e[\s\-\.:]*?(\d+)', str(historico), re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _matching_por_nfe(debitos_idx, creditos_idx, todos_debitos, todos_creditos,
+                       max_parcelas=6, janela_dias=120, max_candidatos=25):
+    """
+    ETAPA 3 (segura) - Agrupa débitos que compartilham o MESMO número de NF-e
+    (nota dividida em CFOPs) e tenta fechar o total do grupo contra uma
+    combinação de créditos (parcelas) dentro de uma janela de dias após a nota.
+    Como o agrupamento usa um identificador exato (nº da NF-e), não há risco de
+    juntar lançamentos de notas diferentes por coincidência.
+    """
+    grupos = defaultdict(list)
+    for i in debitos_idx:
+        chave = _extrair_chave_documento(todos_debitos[i]['Histórico'])
+        if chave:
+            grupos[chave].append(i)
+
+    debitos_usados = set()
+    creditos_usados = set()
+
+    for chave, idxs in grupos.items():
+        total_grupo = sum((todos_debitos[i]['Débito'] for i in idxs), Decimal('0.00'))
+        data_nota = max(pd.to_datetime(todos_debitos[i]['Data Real'], format='%d/%m/%Y') for i in idxs)
+
+        candidatos = [
+            j for j in creditos_idx
+            if j not in creditos_usados
+            and 0 <= (pd.to_datetime(todos_creditos[j]['Data Real'], format='%d/%m/%Y') - data_nota).days <= janela_dias
+        ]
+        candidatos.sort(key=lambda j: pd.to_datetime(todos_creditos[j]['Data Real'], format='%d/%m/%Y'))
+        candidatos = candidatos[:max_candidatos]
+
+        if not candidatos:
+            continue
+
+        encontrado = None
+        for tam in range(1, min(max_parcelas, len(candidatos)) + 1):
+            for combo in combinations(candidatos, tam):
+                if sum((todos_creditos[j]['Crédito'] for j in combo), Decimal('0.00')) == total_grupo:
+                    encontrado = combo
+                    break
+            if encontrado:
+                break
+
+        if encontrado:
+            debitos_usados.update(idxs)
+            creditos_usados.update(encontrado)
+
+    return debitos_usados, creditos_usados
+
+
+def _matching_por_janela_curta(debitos_idx, creditos_idx, todos_debitos, todos_creditos,
+                                janela_dias=5, max_grupo=5, max_candidatos=10):
+    """
+    ETAPA 4 (opcional, use com cautela) - Para lançamentos SEM identificador em
+    comum (ex: vendas de cartão + taxa + recebimento em lote da operadora).
+    Busca, dentro de uma janela curta de dias, uma combinação de débitos cuja
+    soma bata com uma combinação de créditos. Sem um identificador exato, existe
+    risco (baixo, mas real) de casar lançamentos que apenas coincidem em valor -
+    por isso a janela é curta e o resultado fica marcado para revisão.
+    """
+    debitos_usados = set()
+    creditos_usados = set()
+
+    debitos_ordenados = sorted(debitos_idx, key=lambda i: pd.to_datetime(todos_debitos[i]['Data Real'], format='%d/%m/%Y'))
+
+    for i0 in debitos_ordenados:
+        if i0 in debitos_usados:
+            continue
+        data_ref = pd.to_datetime(todos_debitos[i0]['Data Real'], format='%d/%m/%Y')
+
+        deb_janela = [
+            i for i in debitos_idx
+            if i not in debitos_usados
+            and abs((pd.to_datetime(todos_debitos[i]['Data Real'], format='%d/%m/%Y') - data_ref).days) <= janela_dias
+        ][:max_candidatos]
+
+        cred_janela = [
+            j for j in creditos_idx
+            if j not in creditos_usados
+            and 0 <= (pd.to_datetime(todos_creditos[j]['Data Real'], format='%d/%m/%Y') - data_ref).days <= janela_dias
+        ][:max_candidatos]
+
+        if not deb_janela or not cred_janela:
+            continue
+
+        encontrado_d, encontrado_c = None, None
+        for tam_c in range(1, min(max_grupo, len(cred_janela)) + 1):
+            for combo_c in combinations(cred_janela, tam_c):
+                alvo = sum((todos_creditos[j]['Crédito'] for j in combo_c), Decimal('0.00'))
+                for tam_d in range(1, min(max_grupo, len(deb_janela)) + 1):
+                    for combo_d in combinations(deb_janela, tam_d):
+                        if sum((todos_debitos[i]['Débito'] for i in combo_d), Decimal('0.00')) == alvo:
+                            encontrado_d, encontrado_c = combo_d, combo_c
+                            break
+                    if encontrado_d:
+                        break
+                if encontrado_d:
+                    break
+            if encontrado_d:
+                break
+
+        if encontrado_d:
+            debitos_usados.update(encontrado_d)
+            creditos_usados.update(encontrado_c)
+
+    return debitos_usados, creditos_usados
+
+
+def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, tipo,
+                                usar_matching_nfe=True, janela_nfe_dias=120, max_parcelas_nfe=6,
+                                usar_matching_janela=False, janela_curta_dias=5, max_grupo_janela=5):
     if tipo == 'CARTAO':
         col_deb, col_cred = 'Débito', 'Crédito'
     else:
@@ -133,7 +322,8 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     todos_debitos = []
     todos_creditos = []
 
-    if saldo_ant > Decimal('0.00'):
+    tem_saldo_anterior = saldo_ant > Decimal('0.00')
+    if tem_saldo_anterior:
         data_base = df_alvo['Data'].min() if not df_alvo.empty else pd.to_datetime('2026-01-01')
         todos_debitos.append({
             'Data Real': (data_base - pd.Timedelta(days=1)).strftime('%d/%m/%Y'), 'Data': 'Saldo Anterior',
@@ -151,75 +341,72 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     todos_debitos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
     todos_creditos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
 
-    d_cum = [sum(d['Débito'] for d in todos_debitos[:i+1]) for i in range(len(todos_debitos))]
-    c_cum = [sum(c['Crédito'] for c in todos_creditos[:i+1]) for i in range(len(todos_creditos))]
+    # ETAPA 1: fecha o saldo anterior (se houver) contra uma combinação de créditos
+    indices_credito_ant = []
+    if tem_saldo_anterior:
+        indices_credito_ant = _fechar_saldo_anterior(saldo_ant, todos_creditos)
+    saldo_anterior_fechado = tem_saldo_anterior and len(indices_credito_ant) > 0
 
-    matches = []
+    debitos_pool_idx = list(range(1, len(todos_debitos))) if saldo_anterior_fechado else list(range(len(todos_debitos)))
+    creditos_pool_idx = [i for i in range(len(todos_creditos)) if i not in set(indices_credito_ant)]
 
-    for i, target in enumerate(d_cum):
-        try:
-            j = c_cum.index(target)
-            matches.append((i, list(range(j+1))))
-            continue
-        except ValueError:
-            pass
+    # ETAPA 2: matching direto valor-a-valor (1 débito = 1 crédito)
+    debitos_usados, creditos_usados = _matching_direto(debitos_pool_idx, creditos_pool_idx, todos_debitos, todos_creditos)
+    debitos_restantes = [i for i in debitos_pool_idx if i not in debitos_usados]
+    creditos_restantes = [i for i in creditos_pool_idx if i not in creditos_usados]
 
-        start_j = next((idx for idx, val in enumerate(c_cum) if val > target), -1)
-        if start_j == -1:
-            continue
+    # ETAPA 3: matching em grupo por NF-e (seguro - usa identificador exato)
+    if usar_matching_nfe:
+        d_nfe, c_nfe = _matching_por_nfe(
+            debitos_restantes, creditos_restantes, todos_debitos, todos_creditos,
+            max_parcelas=max_parcelas_nfe, janela_dias=janela_nfe_dias
+        )
+        debitos_usados |= d_nfe
+        creditos_usados |= c_nfe
+        debitos_restantes = [i for i in debitos_restantes if i not in d_nfe]
+        creditos_restantes = [i for i in creditos_restantes if i not in c_nfe]
 
-        found = False
-        seen_credits = {}
+    # ETAPA 4: matching em grupo por janela curta (opcional, sem identificador - ex: cartão)
+    itens_marcados_revisao = set()
+    if usar_matching_janela:
+        d_jan, c_jan = _matching_por_janela_curta(
+            debitos_restantes, creditos_restantes, todos_debitos, todos_creditos,
+            janela_dias=janela_curta_dias, max_grupo=max_grupo_janela
+        )
+        debitos_usados |= d_jan
+        creditos_usados |= c_jan
+        itens_marcados_revisao = d_jan | c_jan
+        debitos_restantes = [i for i in debitos_restantes if i not in d_jan]
+        creditos_restantes = [i for i in creditos_restantes if i not in c_jan]
 
-        for k in range(start_j):
-            seen_credits[todos_creditos[k]['Crédito']] = k
+    debitos_pend_idx = debitos_restantes
+    creditos_pend_idx = creditos_restantes
 
-        for j in range(start_j, min(len(c_cum), start_j + 100)):
-            c_val = todos_creditos[j]['Crédito']
-            seen_credits[c_val] = j
+    # marca no histórico os itens conciliados via janela curta, para revisão
+    for i in itens_marcados_revisao:
+        pass  # marcação feita na montagem abaixo
 
-            diff = c_cum[j] - target
-            if diff in seen_credits:
-                drop_idx = seen_credits[diff]
-                matches.append((i, [k for k in range(j+1) if k != drop_idx]))
-                found = True
-                break
+    def marcar(ev, idx_original):
+        if idx_original in itens_marcados_revisao:
+            ev = dict(ev)
+            ev['Histórico'] = '🔎 ' + ev['Histórico']
+        return ev
 
-    d_ant, c_ant = [], []
-    d_atual, c_atual = [], []
+    eventos_ant = []
+    if saldo_anterior_fechado:
+        eventos_ant = [todos_debitos[0]] + [todos_creditos[i] for i in indices_credito_ant]
 
-    if matches:
-        primeiro_match = matches[0]
-        ultimo_match = matches[-1]
+    eventos_atual = (
+        [marcar(todos_debitos[i], i) for i in debitos_usados]
+        + [marcar(todos_creditos[i], i) for i in creditos_usados]
+    )
+    eventos_pend = [todos_debitos[i] for i in debitos_pend_idx] + [todos_creditos[i] for i in creditos_pend_idx]
 
-        idx_d_prim = primeiro_match[0]
-        idx_c_prim = primeiro_match[1]
-
-        idx_d_ult = ultimo_match[0]
-        idx_c_ult = ultimo_match[1]
-
-        if saldo_ant > Decimal('0.00'):
-            d_ant = todos_debitos[:idx_d_prim+1]
-            c_ant = [todos_creditos[k] for k in idx_c_prim]
-
-            if idx_d_ult > idx_d_prim:
-                d_atual = todos_debitos[idx_d_prim+1: idx_d_ult+1]
-                c_atual = [todos_creditos[k] for k in idx_c_ult if k not in idx_c_prim]
-        else:
-            d_atual = todos_debitos[:idx_d_ult+1]
-            c_atual = [todos_creditos[k] for k in idx_c_ult]
-
-        d_pend = todos_debitos[idx_d_ult+1:]
-        c_pend = [todos_creditos[k] for k in range(len(todos_creditos)) if k not in idx_c_ult]
-
-    else:
-        d_pend = todos_debitos.copy()
-        c_pend = todos_creditos.copy()
-
-    todos_eventos = sorted(todos_debitos + todos_creditos, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_ant = sorted(d_ant + c_ant, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_atual = sorted(d_atual + c_atual, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_pend = sorted(d_pend + c_pend, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
+    chave_ordem = lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0)
+    eventos_ant.sort(key=chave_ordem)
+    eventos_atual.sort(key=chave_ordem)
+    eventos_pend.sort(key=chave_ordem)
+    todos_eventos = sorted(todos_debitos + todos_creditos, key=chave_ordem)
 
     razao_tot, saldo_tot = montar_tabela_razao(todos_eventos)
     razao_ant, saldo_ant_aba = montar_tabela_razao(eventos_ant)
@@ -242,7 +429,18 @@ def gerar_excel_memoria(dfs_dict):
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
 st.title("📊 Auditoria Contábil - Domínio Sistemas")
-st.markdown("Emissão Analítica de Livros Razão. Motor de Hash de Alta Performance.")
+st.markdown("Emissão Analítica de Livros Razão. Matching direto + grupo por NF-e + grupo por janela (opcional).")
+
+with st.sidebar:
+    st.subheader("⚙️ Configurações de Matching")
+    usar_nfe = st.checkbox("Agrupar por NF-e (CFOP dividido + parcelamento)", value=True)
+    janela_nfe = st.number_input("Janela de dias após a nota", value=120, step=10)
+    max_parcelas = st.number_input("Máx. de parcelas por grupo NF-e", value=6, step=1, min_value=1)
+    st.markdown("---")
+    usar_janela = st.checkbox("Agrupar por janela curta (sem identificador, ex: cartão) ⚠️", value=False)
+    st.caption("Sem número de documento em comum. Use com cautela — itens conciliados assim vêm marcados com 🔎 para revisão.")
+    janela_curta = st.number_input("Janela de dias", value=5, step=1)
+    max_grupo_janela = st.number_input("Máx. de itens por grupo", value=5, step=1, min_value=1)
 
 modo = st.radio("Selecione a Natureza da Conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
 conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
@@ -280,11 +478,13 @@ if arquivo_lancamentos and conta_input != 0:
         tipo_auditoria = 'CARTAO' if 'Cartões' in modo else 'FORNECEDOR'
 
         r_tot, r_ant, r_atual, r_pend, s_tot, s_ant, s_atual, s_pend = processar_razoes_contabeis(
-            df_base_geral, conta_input, saldo_abertura_var, tipo_auditoria
+            df_base_geral, conta_input, saldo_abertura_var, tipo_auditoria,
+            usar_matching_nfe=usar_nfe, janela_nfe_dias=janela_nfe, max_parcelas_nfe=max_parcelas,
+            usar_matching_janela=usar_janela, janela_curta_dias=janela_curta, max_grupo_janela=max_grupo_janela
         )
 
         if len(r_ant) == 0 and len(r_atual) == 0:
-            st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos exatos na base enviada.")
+            st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados pares/grupos que fechem na base enviada.")
 
         excel_data = gerar_excel_memoria({
             '1. Razão Total': r_tot,
@@ -307,6 +507,9 @@ if arquivo_lancamentos and conta_input != 0:
 
         if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
             st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 perfeitamente.")
+
+        if usar_janela:
+            st.info("🔎 Itens marcados com essa lupa na aba 'Conciliado (Atual)' foram casados por proximidade de data, sem identificador exato — vale conferir manualmente.")
 
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
