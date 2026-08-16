@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
+import itertools
 from decimal import Decimal, ROUND_HALF_UP
 
 st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
@@ -14,8 +16,47 @@ def formatar_moeda(v):
         return Decimal('0.00')
 
 # ==========================================
-# MÓDULOS DE CACHE E LEITURA (ROBUSTEZ)
+# MÓDULOS DE EXTRAÇÃO E LEITURA 
 # ==========================================
+@st.cache_data
+def extrair_metadados_dominio(raw_data, conta_alvo):
+    try:
+        df_raw = pd.read_excel(io.BytesIO(raw_data), header=None)
+    except:
+        try:
+            dfs = pd.read_html(io.BytesIO(raw_data).read())
+            df_raw = dfs[0]
+        except:
+            return "NÃO IDENTIFICADA", "NÃO IDENTIFICADO", "NÃO IDENTIFICADA"
+
+    empresa = "NÃO IDENTIFICADA"
+    periodo = "NÃO IDENTIFICADO"
+    conta_nome = "NÃO IDENTIFICADA"
+    
+    for idx, row in df_raw.head(20).iterrows():
+        row_str = ' '.join(str(x).upper() for x in row.values if pd.notna(x))
+        if 'EMPRESA:' in row_str and empresa == "NÃO IDENTIFICADA":
+            parts = str(row.values[0]).split('Empresa:')
+            if len(parts) > 1:
+                sub_parts = parts[1].split('-')
+                empresa = sub_parts[1].strip() if len(sub_parts) > 1 else parts[1].strip()
+        if ('PERÍODO:' in row_str or 'PERIODO:' in row_str) and periodo == "NÃO IDENTIFICADO":
+            for val in row.values:
+                val_str = str(val).upper()
+                if 'PERÍODO:' in val_str:
+                    periodo = val_str.split('PERÍODO:')[1].strip()
+                elif 'PERIODO:' in val_str:
+                    periodo = val_str.split('PERIODO:')[1].strip()
+
+    if conta_alvo != 0:
+        for col in df_raw.columns:
+            matches = df_raw[col].astype(str).str.extract(fr'Conta:\s*{conta_alvo}\s*-\s*([^0-9]+)', flags=re.IGNORECASE)
+            if not matches.isna().all().values[0]:
+                conta_nome = matches.dropna().iloc[0, 0].strip()
+                break
+
+    return empresa, periodo, conta_nome
+
 @st.cache_data
 def extrair_saldo_balancete(raw_data, conta_alvo):
     try:
@@ -61,7 +102,7 @@ def carregar_base_lancamentos(raw_data):
             dfs = pd.read_html(io.BytesIO(raw_data))
             df_raw = dfs[0]
         except:
-            raise ValueError("Erro de leitura. Certifique-se de que é um Excel (.xlsx ou .xls) válido.")
+            raise ValueError("Erro de leitura. Certifique-se de que é um arquivo suportado.")
 
     header_idx = 5
     for idx, row in df_raw.head(20).iterrows():
@@ -90,8 +131,17 @@ def carregar_base_lancamentos(raw_data):
     return df_main
 
 # ==========================================
-# MOTOR HASH MAP (ALTA PERFORMANCE) E 4 RAZÕES
+# MOTOR COMBINATÓRIO N-PARA-N (EXATO)
 # ==========================================
+def achar_combinacao_exata(lista_candidatos, valor_alvo, max_itens=5):
+    # Procura subconjuntos de tamanho 2 até max_itens que somem o valor alvo exato
+    for r in range(2, max_itens + 1):
+        for combo in itertools.combinations(lista_candidatos, r):
+            soma_combo = sum(item[1]['Valor'] for item in combo)
+            if soma_combo == valor_alvo:
+                return combo
+    return None
+
 def montar_tabela_razao(eventos):
     razao = []
     saldo = Decimal('0.00')
@@ -108,109 +158,128 @@ def montar_tabela_razao(eventos):
     return razao, float(saldo)
 
 def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, tipo):
-    if tipo == 'CARTAO':
-        col_deb, col_cred = 'Débito', 'Crédito'
-    else: 
-        col_deb, col_cred = 'Crédito', 'Débito'
+    col_prov, col_baixa = ('Débito', 'Crédito') if tipo == 'CARTAO' else ('Crédito', 'Débito')
 
     df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
     saldo_ant = abs(Decimal(str(saldo_anterior_informado)))
     
-    todos_debitos = []
-    todos_creditos = []
+    provisoes = []
+    baixas = []
 
     if saldo_ant > Decimal('0.00'):
         data_base = df_alvo['Data'].min() if not df_alvo.empty else pd.to_datetime('2026-01-01')
-        todos_debitos.append({
-            'Data Real': (data_base - pd.Timedelta(days=1)).strftime('%d/%m/%Y'), 'Data': 'Saldo Anterior',
-            'Histórico': 'SALDO ANTERIOR HERDADO', 'Débito': saldo_ant, 'Crédito': Decimal('0.00')
+        provisoes.append({
+            'Data Real': data_base - pd.Timedelta(days=1),
+            'Tipo': 'Anterior',
+            'Valor': saldo_ant,
+            'Original': {
+                'Data': 'Saldo Anterior', 
+                'Histórico': 'SALDO ANTERIOR HERDADO', 
+                'Débito': saldo_ant if tipo == 'CARTAO' else Decimal('0.00'), 
+                'Crédito': saldo_ant if tipo == 'FORNECEDOR' else Decimal('0.00')
+            }
         })
 
     for idx, row in df_alvo.iterrows():
-        dt_str = row['Data'].strftime('%d/%m/%Y')
+        dt = row['Data']
         valor = Decimal(str(row['Valor']))
-        if row[col_deb] == conta_alvo:
-            todos_debitos.append({'Data Real': dt_str, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': valor, 'Crédito': Decimal('0.00')})
-        if row[col_cred] == conta_alvo:
-            todos_creditos.append({'Data Real': dt_str, 'Data': dt_str, 'Histórico': row['Histórico'], 'Débito': Decimal('0.00'), 'Crédito': valor})
-
-    todos_debitos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
-    todos_creditos.sort(key=lambda x: pd.to_datetime(x['Data Real'], format='%d/%m/%Y'))
-
-    d_cum = [sum(d['Débito'] for d in todos_debitos[:i+1]) for i in range(len(todos_debitos))]
-    c_cum = [sum(c['Crédito'] for c in todos_creditos[:i+1]) for i in range(len(todos_creditos))]
-    
-    matches = []
-    
-    # MOTOR DE MATCHING ULTRA-RÁPIDO
-    for i, target in enumerate(d_cum):
-        # 1. Match Perfeito
-        try:
-            j = c_cum.index(target)
-            matches.append((i, list(range(j+1))))
-            continue
-        except ValueError:
-            pass
-            
-        # 2. Match com 1 Omissão (Hash Map em vez de Loop Infinito)
-        start_j = next((idx for idx, val in enumerate(c_cum) if val > target), -1)
-        if start_j == -1: continue
-            
-        found = False
-        seen_credits = {}
         
-        # Preenche a memória até a posição inicial
-        for k in range(start_j):
-            seen_credits[todos_creditos[k]['Crédito']] = k
+        evento = {
+            'Data Real': dt,
+            'Tipo': 'Atual',
+            'Valor': valor,
+            'Original': {
+                'Data': dt.strftime('%d/%m/%Y'), 
+                'Histórico': row['Histórico'], 
+                'Débito': Decimal('0.00'), 
+                'Crédito': Decimal('0.00')
+            }
+        }
+        
+        if row[col_prov] == conta_alvo:
+            evento['Original'][col_prov] = valor
+            provisoes.append(evento)
+        if row[col_baixa] == conta_alvo:
+            evento['Original'][col_baixa] = valor
+            baixas.append(evento)
+
+    provisoes.sort(key=lambda x: x['Data Real'])
+    baixas.sort(key=lambda x: x['Data Real'])
+
+    matched_provisoes = set()
+    matched_baixas = set()
+    
+    eventos_ant = []
+    eventos_atual = []
+
+    def registrar_match(lista_p_idx, lista_b_idx):
+        for p_idx in lista_p_idx:
+            matched_provisoes.add(p_idx)
+            p = provisoes[p_idx]
+            if p['Tipo'] == 'Anterior': eventos_ant.append(p['Original'])
+            else: eventos_atual.append(p['Original'])
             
-        # Analisa uma janela de segurança (máx 100 lançamentos à frente para evitar sobrecarga)
-        for j in range(start_j, min(len(c_cum), start_j + 100)):
-            c_val = todos_creditos[j]['Crédito']
-            seen_credits[c_val] = j
-            
-            diff = c_cum[j] - target
-            if diff in seen_credits:
-                drop_idx = seen_credits[diff]
-                matches.append((i, [k for k in range(j+1) if k != drop_idx]))
-                found = True
+        for b_idx in lista_b_idx:
+            matched_baixas.add(b_idx)
+            b = baixas[b_idx]
+            if b['Tipo'] == 'Anterior': eventos_ant.append(b['Original'])
+            else: eventos_atual.append(b['Original'])
+
+    # FASE 1: Pareamento 1-para-1 exato
+    for i, b in enumerate(baixas):
+        for j, p in enumerate(provisoes):
+            if j in matched_provisoes: continue
+            if p['Valor'] == b['Valor'] and 0 <= (b['Data Real'] - p['Data Real']).days <= 60:
+                registrar_match([j], [i])
                 break
 
-    # SEPARAÇÃO DAS 4 ABAS
-    d_ant, c_ant = [], []
-    d_atual, c_atual = [], []
-    
-    if matches:
-        primeiro_match = matches[0]
-        ultimo_match = matches[-1]
+    # FASE 2: Agrupamento N-para-1 (Várias Notas para 1 Pagamento)
+    for i, b in enumerate(baixas):
+        if i in matched_baixas: continue
         
-        idx_d_prim = primeiro_match[0]
-        idx_c_prim = primeiro_match[1]
+        candidatos_p = [(j, p) for j, p in enumerate(provisoes) 
+                        if j not in matched_provisoes 
+                        and 0 <= (b['Data Real'] - p['Data Real']).days <= 60
+                        and p['Valor'] < b['Valor']]
         
-        idx_d_ult = ultimo_match[0]
-        idx_c_ult = ultimo_match[1]
-        
-        if saldo_ant > Decimal('0.00'):
-            d_ant = todos_debitos[:idx_d_prim+1]
-            c_ant = [todos_creditos[k] for k in idx_c_prim]
-            
-            if idx_d_ult > idx_d_prim:
-                d_atual = todos_debitos[idx_d_prim+1 : idx_d_ult+1]
-                c_atual = [todos_creditos[k] for k in idx_c_ult if k not in idx_c_prim]
-        else:
-            d_atual = todos_debitos[:idx_d_ult+1]
-            c_atual = [todos_creditos[k] for k in idx_c_ult]
-            
-        d_pend = todos_debitos[idx_d_ult+1:]
-        c_pend = [todos_creditos[k] for k in range(len(todos_creditos)) if k not in idx_c_ult]
-        
-    else:
-        d_pend = todos_debitos.copy()
-        c_pend = todos_creditos.copy()
+        combo = achar_combinacao_exata(candidatos_p, b['Valor'])
+        if combo:
+            indices_p = [item[0] for item in combo]
+            registrar_match(indices_p, [i])
 
-    todos_eventos = sorted(todos_debitos + todos_creditos, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_ant = sorted(d_ant + c_ant, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_atual = sorted(d_atual + c_atual, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
-    eventos_pend = sorted(d_pend + c_pend, key=lambda x: (pd.to_datetime(x['Data Real'], format='%d/%m/%Y'), x['Crédito'] > 0))
+    # FASE 3: Agrupamento 1-para-N (1 Nota para Vários Pagamentos/Parcelas)
+    for j, p in enumerate(provisoes):
+        if j in matched_provisoes: continue
+        
+        candidatos_b = [(i, b) for i, b in enumerate(baixas) 
+                        if i not in matched_baixas 
+                        and 0 <= (b['Data Real'] - p['Data Real']).days <= 60
+                        and b['Valor'] < p['Valor']]
+        
+        combo = achar_combinacao_exata(candidatos_b, p['Valor'])
+        if combo:
+            indices_b = [item[0] for item in combo]
+            registrar_match([j], indices_b)
+
+    # O que não combinou vai para PENDENTE, o laço continua normalmente
+    eventos_pend = []
+    for j, p in enumerate(provisoes):
+        if j not in matched_provisoes: eventos_pend.append(p['Original'])
+            
+    for i, b in enumerate(baixas):
+        if i not in matched_baixas: eventos_pend.append(b['Original'])
+
+    todos_eventos = [p['Original'] for p in provisoes] + [b['Original'] for b in baixas]
+
+    def sort_event(e):
+        dt = pd.to_datetime(e['Data'], format='%d/%m/%Y', errors='coerce')
+        if pd.isna(dt): dt = pd.to_datetime('1900-01-01')
+        return (dt, e['Crédito'] > 0)
+
+    todos_eventos.sort(key=sort_event)
+    eventos_ant.sort(key=sort_event)
+    eventos_atual.sort(key=sort_event)
+    eventos_pend.sort(key=sort_event)
 
     razao_tot, saldo_tot = montar_tabela_razao(todos_eventos)
     razao_ant, saldo_ant_aba = montar_tabela_razao(eventos_ant)
@@ -229,18 +298,21 @@ def gerar_excel_memoria(dfs_dict):
 # ==========================================
 # INTERFACE DE USUÁRIO (STREAMLIT)
 # ==========================================
-st.title("Auditoria Contábil - Domínio Sistemas")
-st.markdown("Emissão Analítica de Livros Razão. Motor de Hash de Alta Performance.")
+st.title("📊 Auditoria Contábil - Domínio Sistemas")
+st.markdown("Emissão Analítica de Livros Razão com Motor Combinatório de Soma Exata.")
 
-modo = st.radio("Selecione a Natureza da Conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
-conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059)", value=0, step=1)
+col_nat, col_conta = st.columns(2)
+with col_nat:
+    modo = st.radio("Selecione a Natureza da Conta:", ["🏢 1. Cartões a Receber (Ativo)", "🏦 2. Fornecedores a Pagar (Passivo)"])
+with col_conta:
+    conta_input = st.number_input("Digite a conta contábil alvo (Ex: 623 ou 1059):", value=0, step=1)
 
 st.markdown("---")
 col_arq1, col_arq2 = st.columns(2)
 with col_arq1:
-    arquivo_lancamentos = st.file_uploader("1. Anexe a Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
+    arquivo_lancamentos = st.file_uploader("📂 1. Anexe a Base Geral de Lançamentos (.xls/.xlsx)", type=["xls", "xlsx"])
 with col_arq2:
-    arquivo_balancete = st.file_uploader("2. Anexe o Balancete Opcional (.xls ou .xlsx)", type=["xls", "xlsx"])
+    arquivo_balancete = st.file_uploader("📑 2. Anexe o Balancete Opcional (.xls/.xlsx)", type=["xls", "xlsx"])
 
 saldo_abertura_var = Decimal('0.00')
 
@@ -250,19 +322,26 @@ if arquivo_balancete and conta_input != 0:
         saldo_abertura_var = extrair_saldo_balancete(bytes_balancete, conta_input)
         st.success(f"✔️ Saldo Anterior de R$ {float(saldo_abertura_var):,.2f} capturado do Balancete.".replace(",", "X").replace(".", ",").replace("X", "."))
     except Exception as e:
-        st.error(f"Erro ao analisar o Balancete. Verifique o formato do arquivo.")
-        saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00)))
+        st.error("Erro ao analisar o Balancete. Verifique o formato.")
+        saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$):", value=0.00)))
 elif not arquivo_balancete:
-    saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00, step=100.00)))
+    saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$):", value=0.00, step=100.00)))
 
 if arquivo_lancamentos and conta_input != 0:
     try:
         bytes_lancamentos = arquivo_lancamentos.getvalue()
+        
+        empresa_ext, periodo_ext, conta_nome_ext = extrair_metadados_dominio(bytes_lancamentos, conta_input)
+        
+        st.markdown(f"### 🏢 Empresa: **{empresa_ext}**")
+        st.markdown(f"**📅 Competência:** {periodo_ext} | **🏷️ Conta:** {conta_input} - {conta_nome_ext}")
+        st.markdown("---")
+        
         df_base_geral = carregar_base_lancamentos(bytes_lancamentos)
         
         tem_na_base = (df_base_geral['Débito'] == conta_input).any() or (df_base_geral['Crédito'] == conta_input).any()
         if not tem_na_base:
-            st.error(f"❌ EXECUÇÃO BLOQUEADA: A conta {conta_input} não possui lançamentos no arquivo anexado. Digite o número correto.")
+            st.error(f"❌ EXECUÇÃO BLOQUEADA: A conta {conta_input} não possui lançamentos no arquivo anexado.")
             st.stop()
             
         tipo_auditoria = 'CARTAO' if 'Cartões' in modo else 'FORNECEDOR'
@@ -272,7 +351,7 @@ if arquivo_lancamentos and conta_input != 0:
         )
         
         if len(r_ant) == 0 and len(r_atual) == 0:
-            st.error("🚨 ATENÇÃO: NENHUMA CONCILIAÇÃO OCORREU. Não foram encontrados blocos exatos na base enviada.")
+            st.warning("⚠️ Atenção: Nenhum pareamento exato (simples ou agrupado) foi encontrado nas regras definidas.")
         
         excel_data = gerar_excel_memoria({
             '1. Razão Total': r_tot,
@@ -281,25 +360,26 @@ if arquivo_lancamentos and conta_input != 0:
             '4. Não Conciliado (Pendente)': r_pend
         })
         
-        st.download_button(label="📥 Baixar 4 Razões (Excel)", data=excel_data, 
-                           file_name=f"Auditoria_4Razoes_{conta_input}.xlsx", 
+        nome_arquivo = f"Conciliacao_{empresa_ext.replace(' ', '_')}_{conta_input}.xlsx"
+        st.download_button(label="📥 Baixar Detalhamento do Razão (Excel)", data=excel_data, 
+                           file_name=nome_arquivo, 
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         
         st.write("---")
-        st.subheader("Balanço de Validação das Abas")
+        st.subheader("Balanço de Validação")
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.info(f"**Aba 1 (Total)**\nR$ {s_tot:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.info(f"**Total**\nR$ {s_tot:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         with col2:
-            st.success(f"**Aba 2 (Ant)**\nR$ {s_ant:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.success(f"**Anterior**\nR$ {s_ant:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         with col3:
-            st.success(f"**Aba 3 (Atual)**\nR$ {s_atual:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.success(f"**Atual**\nR$ {s_atual:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
         with col4:
-            st.warning(f"**Aba 4 (Pend)**\nR$ {s_pend:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            st.warning(f"**Pendente**\nR$ {s_pend:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
-        if abs(s_ant) == 0.0 and abs(s_atual) == 0.0 and round(s_tot, 2) == round(s_pend, 2):
-            st.success("✅ **Auditoria Validada:** As abas de itens conciliados fecharam em R$ 0,00 perfeitamente.")
+        if round(s_tot, 2) == round(s_pend, 2):
+            st.success("✅ **Auditoria Concluída:** A estruturação matemática das pendências está correta (Total e Pendente coincidem).")
         
     except Exception as e:
         st.error(f"Falha na execução. Detalhe técnico: {e}")
