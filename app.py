@@ -212,24 +212,20 @@ def montar_tabela_razao(eventos):
 
 
 def _fechar_saldo_anterior(saldo_ant, creditos):
-    """Fecha o saldo anterior (débito único) contra uma combinação de créditos em
-    sequência cuja soma bata exatamente, permitindo 1 crédito 'fora da ordem'."""
+    """
+    Fecha o saldo anterior (débito único) contra uma combinação EXATA de
+    créditos, usando busca por soma de subconjunto (bitset - robusta, não se
+    limita a 'primeiros da fila com 1 omissão' como a versão anterior).
+    Retorna a lista de índices (em 'creditos') usados para fechar o saldo.
+    """
     if saldo_ant <= 0 or not creditos:
         return []
-    acumulado = Decimal('0.00')
-    indices = []
-    for idx, c in enumerate(creditos):
-        acumulado += c['Crédito']
-        indices.append(idx)
-        if acumulado == saldo_ant:
-            return indices
-        if acumulado > saldo_ant:
-            diff = acumulado - saldo_ant
-            for ci in indices:
-                if creditos[ci]['Crédito'] == diff:
-                    return [i for i in indices if i != ci]
-            return []
-    return []
+
+    valores_cents = [int((c['Crédito'] * 100).to_integral_value()) for c in creditos]
+    alvo_cents = int((saldo_ant * 100).to_integral_value())
+
+    resultado = _subset_sum_bitset(valores_cents, alvo_cents)
+    return resultado if resultado is not None else []
 
 
 def _dentro_da_janela(data_deb, data_cred, janela_dias):
@@ -506,8 +502,11 @@ def gerar_excel_memoria(dfs_dict):
 # ==========================================
 st.title("📊 Auditoria Contábil - Domínio Sistemas")
 
-st.markdown("---")
-arquivo_lancamentos = st.file_uploader("📁 Anexe a Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    arquivo_lancamentos = st.file_uploader("📁 Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
+with col_up2:
+    arquivo_balancete = st.file_uploader("📁 Balancete (.xls ou .xlsx)", type=["xls", "xlsx"])
 
 empresa, periodo, contas_nomes = None, None, {}
 if arquivo_lancamentos:
@@ -518,7 +517,30 @@ if empresa:
 if periodo:
     st.caption(f"🗓️ Competência/Período: {periodo}")
 
+lista_contas = []
+if arquivo_balancete:
+    lista_contas = extrair_lista_contas_balancete(arquivo_balancete.getvalue())
+
 with st.sidebar:
+    st.subheader("🗂️ Conta e Natureza")
+    modo = st.radio("Natureza da conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
+
+    conta_input = 0
+    if lista_contas:
+        opcoes = [f"{cod} - {nome}" for cod, nome, _ in lista_contas]
+        escolha = st.selectbox("🔢 Conta contábil (código - nome)", options=["— selecione —"] + opcoes)
+        if escolha != "— selecione —":
+            conta_input = int(escolha.split(" - ", 1)[0])
+    else:
+        conta_input = st.number_input("🔢 Digite a conta contábil", value=0, step=1)
+        st.caption("📁 Anexe o Balancete para escolher a conta numa lista, em vez de digitar.")
+
+    if conta_input != 0 and conta_input in contas_nomes:
+        st.caption(f"📄 {contas_nomes[conta_input]}")
+    elif conta_input != 0 and arquivo_lancamentos:
+        st.caption("⚠️ Conta não encontrada no arquivo de lançamentos.")
+
+    st.markdown("---")
     st.subheader("⚙️ Configurações de Matching")
     janela_dias = st.number_input("📅 Janela máxima entre débito e crédito (dias)", value=60, step=10, min_value=1)
     st.caption("Crédito nunca pode ser anterior ao débito. Fora dessa janela, o item fica pendente.")
@@ -530,34 +552,7 @@ with st.sidebar:
     janela_dias_cartao = st.number_input("Janela de dias (débito → recebimento)", value=30, step=5, min_value=1)
     st.caption("Agrupa débitos do mesmo dia e busca uma combinação de créditos que feche o total, dentro da janela.")
 
-col_nat, col_conta = st.columns([1.3, 1])
-with col_nat:
-    modo = st.radio("Natureza da conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
-with col_conta:
-    st.markdown("**🔢 Conta contábil alvo**")
-
 st.markdown("---")
-arquivo_balancete = st.file_uploader("📁 Anexe o Balancete (.xls ou .xlsx) — usado para listar as contas e o saldo anterior", type=["xls", "xlsx"])
-
-lista_contas = []
-if arquivo_balancete:
-    lista_contas = extrair_lista_contas_balancete(arquivo_balancete.getvalue())
-
-conta_input = 0
-with col_conta:
-    if lista_contas:
-        opcoes = [f"{cod} - {nome}" for cod, nome, _ in lista_contas]
-        escolha = st.selectbox("Escolha a conta (código - nome)", options=["— selecione —"] + opcoes)
-        if escolha != "— selecione —":
-            conta_input = int(escolha.split(" - ", 1)[0])
-    else:
-        conta_input = st.number_input("Digite a conta contábil (anexe o Balancete para escolher da lista)", value=0, step=1)
-        st.caption("📁 Anexe o Balancete acima para escolher a conta numa lista, em vez de digitar.")
-
-    if conta_input != 0 and conta_input in contas_nomes:
-        st.caption(f"📄 {contas_nomes[conta_input]}")
-    elif conta_input != 0 and arquivo_lancamentos:
-        st.caption("⚠️ Conta não encontrada no arquivo de lançamentos.")
 
 saldo_abertura_var = Decimal('0.00')
 
