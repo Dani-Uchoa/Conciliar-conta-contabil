@@ -26,6 +26,53 @@ def formatar_brl(valor):
 # MÓDULOS DE CACHE E LEITURA (ROBUSTEZ)
 # ==========================================
 @st.cache_data
+def extrair_lista_contas_balancete(raw_data):
+    """Lê o Balancete e retorna a lista de contas ANALÍTICAS (as que recebem
+    lançamento direto - sem contas 'filhas' na classificação), já ordenadas
+    hierarquicamente, como [(codigo, nome, classificacao), ...]."""
+    try:
+        df = pd.read_excel(io.BytesIO(raw_data))
+    except Exception:
+        return []
+
+    df.columns = [str(c).strip() for c in df.columns]
+    col_codigo = next((c for c in df.columns if 'CÓDIGO' in c.upper() or 'CODIGO' in c.upper()), None)
+    col_classif = next((c for c in df.columns if 'CLASSIFICA' in c.upper()), None)
+    col_nome = next((c for c in df.columns if 'DESCRI' in c.upper()), None)
+    if not col_codigo or not col_nome:
+        return []
+
+    df[col_codigo] = pd.to_numeric(df[col_codigo], errors='coerce')
+    df = df.dropna(subset=[col_codigo])
+
+    if col_classif:
+        df[col_classif] = df[col_classif].apply(lambda x: '' if pd.isna(x) else str(x))
+        classificacoes = set(df[col_classif])
+
+        def eh_analitica(c):
+            if not c:
+                return True
+            prefixo = c + '.'
+            return not any(o.startswith(prefixo) for o in classificacoes if o != c)
+
+        df = df[df[col_classif].apply(eh_analitica)]
+
+        def chave_natural(c):
+            return tuple(int(p) if p.isdigit() else p for p in c.split('.')) if c else (0,)
+        df = df.sort_values(by=col_classif, key=lambda col: col.map(chave_natural))
+    else:
+        df = df.sort_values(by=col_codigo)
+
+    resultado = []
+    for _, row in df.iterrows():
+        codigo = int(row[col_codigo])
+        nome = str(row[col_nome]).strip() if not pd.isna(row[col_nome]) else ''
+        classif = str(row[col_classif]).strip() if col_classif and not pd.isna(row[col_classif]) else ''
+        resultado.append((codigo, nome, classif))
+    return resultado
+
+
+@st.cache_data
 def extrair_saldo_balancete(raw_data, conta_alvo):
     try:
         df_balancete = pd.read_excel(io.BytesIO(raw_data))
@@ -383,13 +430,15 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     todos_debitos.sort(key=lambda x: x['Data_dt'])
     todos_creditos.sort(key=lambda x: x['Data_dt'])
 
-    # ETAPA 1: fecha o saldo anterior (se houver) contra uma combinação de créditos
+    # ETAPA 1: fecha o saldo anterior (se houver) contra uma combinação de créditos.
+    # O débito do saldo anterior NUNCA entra nas etapas seguintes (2/3/4) -
+    # ele e os créditos usados para fechá-lo (se algum for encontrado) sempre
+    # ficam na aba "Ano Anterior", mesmo que não feche 100% (fica a diferença).
     indices_credito_ant = []
     if tem_saldo_anterior:
         indices_credito_ant = _fechar_saldo_anterior(saldo_ant, todos_creditos)
-    saldo_anterior_fechado = tem_saldo_anterior and len(indices_credito_ant) > 0
 
-    debitos_pool_idx = list(range(1, len(todos_debitos))) if saldo_anterior_fechado else list(range(len(todos_debitos)))
+    debitos_pool_idx = list(range(1, len(todos_debitos))) if tem_saldo_anterior else list(range(len(todos_debitos)))
     creditos_pool_idx = [i for i in range(len(todos_creditos)) if i not in set(indices_credito_ant)]
 
     # ETAPA 2: matching direto valor-a-valor (1 débito = 1 crédito), respeitando a janela
@@ -423,7 +472,7 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     creditos_pend_idx = creditos_restantes
 
     eventos_ant = []
-    if saldo_anterior_fechado:
+    if tem_saldo_anterior:
         eventos_ant = [todos_debitos[0]] + [todos_creditos[i] for i in indices_credito_ant]
 
     eventos_atual = [todos_debitos[i] for i in debitos_usados] + [todos_creditos[i] for i in creditos_usados]
@@ -485,14 +534,30 @@ col_nat, col_conta = st.columns([1.3, 1])
 with col_nat:
     modo = st.radio("Natureza da conta:", ["1. Cartões a Receber (Ativo)", "2. Fornecedores a Pagar (Passivo)"])
 with col_conta:
-    conta_input = st.number_input("🔢 Digite a conta contábil alvo", value=0, step=1)
+    st.markdown("**🔢 Conta contábil alvo**")
+
+st.markdown("---")
+arquivo_balancete = st.file_uploader("📁 Anexe o Balancete (.xls ou .xlsx) — usado para listar as contas e o saldo anterior", type=["xls", "xlsx"])
+
+lista_contas = []
+if arquivo_balancete:
+    lista_contas = extrair_lista_contas_balancete(arquivo_balancete.getvalue())
+
+conta_input = 0
+with col_conta:
+    if lista_contas:
+        opcoes = [f"{cod} - {nome}" for cod, nome, _ in lista_contas]
+        escolha = st.selectbox("Escolha a conta (código - nome)", options=["— selecione —"] + opcoes)
+        if escolha != "— selecione —":
+            conta_input = int(escolha.split(" - ", 1)[0])
+    else:
+        conta_input = st.number_input("Digite a conta contábil (anexe o Balancete para escolher da lista)", value=0, step=1)
+        st.caption("📁 Anexe o Balancete acima para escolher a conta numa lista, em vez de digitar.")
+
     if conta_input != 0 and conta_input in contas_nomes:
         st.caption(f"📄 {contas_nomes[conta_input]}")
     elif conta_input != 0 and arquivo_lancamentos:
-        st.caption("⚠️ Conta não encontrada no arquivo anexado.")
-
-st.markdown("---")
-arquivo_balancete = st.file_uploader("📁 Anexe o Balancete Opcional (.xls ou .xlsx)", type=["xls", "xlsx"])
+        st.caption("⚠️ Conta não encontrada no arquivo de lançamentos.")
 
 saldo_abertura_var = Decimal('0.00')
 
@@ -504,7 +569,7 @@ if arquivo_balancete and conta_input != 0:
     except Exception as e:
         st.error(f"Erro ao analisar o Balancete: {e}")
         saldo_abertura_var = Decimal(str(st.number_input("Digite o Saldo Anterior Manualmente (R$)", value=0.00)))
-elif not arquivo_balancete:
+elif not arquivo_balancete and conta_input != 0:
     saldo_abertura_var = Decimal(str(st.number_input("Saldo Anterior Manual (R$)", value=0.00, step=100.00)))
 
 if arquivo_lancamentos and conta_input != 0:
