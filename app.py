@@ -502,15 +502,32 @@ def gerar_excel_memoria(dfs_dict):
 # ==========================================
 st.title("📊 Auditoria Contábil - Domínio Sistemas")
 
+
+def _widget_upload(label, key_prefix):
+    """
+    Uploader com key fixa, para o Streamlit manter o arquivo na memória da
+    sessão mesmo quando outros campos da tela mudam (ex: trocar a conta).
+    Some só quando a pessoa clica no 'x' do próprio anexo para removê-lo.
+    Retorna (bytes_do_arquivo, nome_do_arquivo) ou (None, None).
+    """
+    arquivo = st.file_uploader(label, type=["xls", "xlsx"], key=f"{key_prefix}_uploader")
+    if arquivo is not None:
+        return arquivo.getvalue(), arquivo.name
+    return None, None
+
+
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    arquivo_lancamentos = st.file_uploader("📁 Base Geral de Lançamentos (.xls ou .xlsx)", type=["xls", "xlsx"])
+    bytes_lancamentos, nome_lancamentos = _widget_upload("📁 Base Geral de Lançamentos (.xls ou .xlsx)", "lancamentos")
 with col_up2:
-    arquivo_balancete = st.file_uploader("📁 Balancete (.xls ou .xlsx)", type=["xls", "xlsx"])
+    bytes_balancete, nome_balancete = _widget_upload("📁 Balancete (.xls ou .xlsx)", "balancete")
+
+arquivo_lancamentos = bytes_lancamentos is not None
+arquivo_balancete = bytes_balancete is not None
 
 empresa, periodo, contas_nomes = None, None, {}
 if arquivo_lancamentos:
-    empresa, periodo, contas_nomes = extrair_cabecalho(arquivo_lancamentos.getvalue())
+    empresa, periodo, contas_nomes = extrair_cabecalho(bytes_lancamentos)
 
 if empresa:
     st.markdown(f"### 🏢 {empresa}")
@@ -519,7 +536,7 @@ if periodo:
 
 lista_contas = []
 if arquivo_balancete:
-    lista_contas = extrair_lista_contas_balancete(arquivo_balancete.getvalue())
+    lista_contas = extrair_lista_contas_balancete(bytes_balancete)
 
 with st.sidebar:
     st.subheader("🗂️ Conta e Natureza")
@@ -558,7 +575,6 @@ saldo_abertura_var = Decimal('0.00')
 
 if arquivo_balancete and conta_input != 0:
     try:
-        bytes_balancete = arquivo_balancete.getvalue()
         saldo_abertura_var = extrair_saldo_balancete(bytes_balancete, conta_input)
         st.success(f"✔️ Saldo Anterior de {formatar_brl(saldo_abertura_var)} capturado do Balancete.")
     except Exception as e:
@@ -569,7 +585,6 @@ elif not arquivo_balancete and conta_input != 0:
 
 if arquivo_lancamentos and conta_input != 0:
     try:
-        bytes_lancamentos = arquivo_lancamentos.getvalue()
         df_base_geral = carregar_base_lancamentos(bytes_lancamentos)
 
         tem_na_base = (df_base_geral['Débito'] == conta_input).any() or (df_base_geral['Crédito'] == conta_input).any()
