@@ -4,7 +4,7 @@ import io
 import re
 from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict, deque
-from itertools import combinations  # usado apenas no matching por NF-e
+from itertools import combinations
 
 st.set_page_config(page_title="Auditoria Contábil - Domínio Sistemas", layout="wide")
 
@@ -141,7 +141,7 @@ def carregar_base_lancamentos(raw_data):
 
 
 # ==========================================
-# MOTOR DE CONCILIAÇÃO (v7 — cartões com máscaras de bits)
+# MOTOR DE CONCILIAÇÃO (v6)
 # Regras confirmadas:
 #  - crédito nunca pode ser anterior ao débito (cronológico)
 #  - janela máxima de dias entre provisão e baixa (padrão 60, configurável)
@@ -270,215 +270,88 @@ def _matching_por_nfe(debitos_idx, creditos_idx, todos_debitos, todos_creditos,
     return debitos_usados, creditos_usados
 
 
-from decimal import Decimal
-
-
-def centavos_exatos(valor):
-    """Converte um valor monetário já normalizado em centavos inteiros."""
-    if isinstance(valor, Decimal):
-        return int(valor.quantize(Decimal('0.01')) * 100)
-    return int(Decimal(str(valor)).quantize(Decimal('0.01')) * 100)
-
-
-def reach_bitset(valores, max_itens):
-    """Calcula somas alcançáveis por quantidade de itens usando inteiros.
-
-    No resultado, `resultado[k]` é um inteiro em que o bit `s` vale 1 quando
-    existe um subconjunto de exatamente `k` valores cuja soma é `s` centavos.
-    A atualização `bitset |= bitset << valor` é feita pelo runtime em operações
-    de inteiros, sem enumerar combinações de índices em Python.
+def _subset_sum_bitset(valores_cents, alvo_cents):
     """
-    limite = max(0, min(int(max_itens), len(valores)))
-    resultado = [0] * (limite + 1)
-    resultado[0] = 1
-    for pos, valor in enumerate(valores):
-        valor = int(valor)
-        if valor <= 0:
+    Encontra um subconjunto de 'valores_cents' cuja soma seja EXATAMENTE
+    'alvo_cents', usando somas representadas como bits de um inteiro (rápido:
+    operações nativas em lote, em vez de testar combinação por combinação).
+    Retorna a lista de posições (índices em valores_cents) usadas, ou None.
+    """
+    if alvo_cents <= 0:
+        return None
+    mask = (1 << (alvo_cents + 1)) - 1
+    estados = [1]
+    reachable = 1
+    achou_em = None
+    for i, v in enumerate(valores_cents):
+        if v <= 0 or v > alvo_cents:
+            estados.append(reachable)
             continue
-        topo = min(limite, pos + 1)
-        for k in range(topo, 0, -1):
-            resultado[k] |= resultado[k - 1] << valor
-    return resultado
-
-
-def _recuperar_subconjunto(valores, alvo, max_itens, quantidade_preferida=None):
-    """Recupera índices locais de uma soma encontrada pelo bitset."""
-    alvo = int(alvo)
-    if alvo < 0 or not valores or max_itens <= 0:
-        return None
-
-    n = len(valores)
-    limite = min(int(max_itens), n)
-    sufixo = [[0] * (limite + 1) for _ in range(n + 1)]
-    sufixo[n][0] = 1
-    for pos in range(n - 1, -1, -1):
-        sufixo[pos][0] = 1
-        valor = int(valores[pos])
-        for k in range(1, min(limite, n - pos) + 1):
-            sufixo[pos][k] = sufixo[pos + 1][k] | (sufixo[pos + 1][k - 1] << valor)
-
-    if quantidade_preferida is not None:
-        quantidades = [int(quantidade_preferida)]
-    else:
-        quantidades = range(1, limite + 1)
-    quantidade = next(
-        (
-            k for k in quantidades
-            if 0 <= k <= limite and ((sufixo[0][k] >> alvo) & 1)
-        ),
-        None,
-    )
-    if quantidade is None:
-        return None
-
-    restante = alvo
-    faltam = quantidade
-    mascara = 0
-    for pos, valor in enumerate(valores):
-        valor = int(valor)
-        if faltam == 0:
+        reachable = (reachable | (reachable << v)) & mask
+        estados.append(reachable)
+        if (reachable >> alvo_cents) & 1:
+            achou_em = i
             break
-        pode_pular = (
-            ((sufixo[pos + 1][faltam] >> restante) & 1)
-            if faltam <= limite else 0
-        )
-        if pode_pular:
+    if achou_em is None:
+        return None
+
+    itens = []
+    alvo_atual = alvo_cents
+    for i in range(achou_em, -1, -1):
+        if alvo_atual == 0:
+            break
+        antes = estados[i]
+        if (antes >> alvo_atual) & 1:
             continue
-        if (
-            restante >= valor
-            and ((sufixo[pos + 1][faltam - 1] >> (restante - valor)) & 1)
-        ):
-            mascara |= 1 << pos
-            restante -= valor
-            faltam -= 1
-        else:
-            return None
-    return mascara if restante == 0 and faltam == 0 else None
+        itens.append(i)
+        alvo_atual -= valores_cents[i]
+    return itens
 
 
-def _matching_por_janela(
-    debitos_idx,
-    creditos_idx,
-    todos_debitos,
-    todos_creditos,
-    janela_dias=60,
-    max_grupo=6,
-    max_candidatos=14,
-):
-    """Concilia cartões por janela com subset-sum em máscaras de bits.
-
-    A semântica é equivalente ao fallback original: crédito não pode ser
-    anterior ao débito; primeiro tenta o débito isolado e depois grupos que
-    incluem o débito corrente; cada item só pode ser usado uma vez.
+def _matching_por_dia(debitos_idx, creditos_idx, todos_debitos, todos_creditos, janela_dias=30):
     """
+    Fallback para lançamentos SEM identificador em comum (ex: vendas de cartão
+    liquidadas com a taxa da operadora). Agrupa os débitos pendentes por DIA
+    (já que cada dia representa um lote/lançamento da maquininha) e busca, via
+    soma de subconjunto (bitset - rápido mesmo com muitos candidatos), uma
+    combinação de créditos dentro da janela de dias que feche o total do dia.
+    """
+    grupos_dia = defaultdict(list)
+    for i in debitos_idx:
+        grupos_dia[todos_debitos[i]['Data_dt'].date()].append(i)
+
     debitos_usados = set()
     creditos_usados = set()
-    debitos_ordenados = sorted(debitos_idx, key=lambda i: todos_debitos[i]['Data_dt'])
 
-    for i0 in debitos_ordenados:
-        if i0 in debitos_usados:
-            continue
-        data_ref = todos_debitos[i0]['Data_dt']
-        deb_janela = [i0] + [
-            i for i in debitos_idx
-            if i != i0
-            and i not in debitos_usados
-            and 0 <= (todos_debitos[i]['Data_dt'] - data_ref).days <= janela_dias
-        ]
-        deb_janela = deb_janela[:max_candidatos]
+    for dia in sorted(grupos_dia.keys()):
+        idxs = grupos_dia[dia]
+        alvo = sum((todos_debitos[i]['Débito'] for i in idxs), Decimal('0.00'))
+        data_dia = todos_debitos[idxs[0]]['Data_dt']
 
-        cred_janela = [
+        candidatos = [
             j for j in creditos_idx
             if j not in creditos_usados
-            and 0 <= (todos_creditos[j]['Data_dt'] - data_ref).days <= janela_dias
+            and _dentro_da_janela(data_dia, todos_creditos[j]['Data_dt'], janela_dias)
         ]
-        cred_janela.sort(key=lambda j: todos_creditos[j]['Data_dt'])
-        cred_janela = cred_janela[:max_candidatos]
-        if not cred_janela:
+        if not candidatos:
             continue
+        candidatos.sort(key=lambda j: todos_creditos[j]['Data_dt'])
 
-        valores_creditos = [
-            centavos_exatos(todos_creditos[j]['Crédito']) for j in cred_janela
-        ]
-        alvo_solo = centavos_exatos(todos_debitos[i0]['Débito'])
-        mascara_creditos = _recuperar_subconjunto(
-            valores_creditos, alvo_solo, max_grupo
-        )
-        if mascara_creditos is not None:
-            encontrados = [
-                cred_janela[pos]
-                for pos in range(len(cred_janela))
-                if (mascara_creditos >> pos) & 1
-            ]
-            debitos_usados.add(i0)
-            creditos_usados.update(encontrados)
-            continue
+        valores_cents = [int((todos_creditos[j]['Crédito'] * 100).to_integral_value()) for j in candidatos]
+        alvo_cents = int((alvo * 100).to_integral_value())
 
-        if len(deb_janela) < 2:
-            continue
-
-        valor_base = centavos_exatos(todos_debitos[i0]['Débito'])
-        valores_outros_debitos = [
-            centavos_exatos(todos_debitos[i]['Débito']) for i in deb_janela[1:]
-        ]
-        alcancaveis_debitos = reach_bitset(
-            valores_outros_debitos, max(0, max_grupo - 1)
-        )
-        alcancaveis_creditos = reach_bitset(valores_creditos, max_grupo)
-        creditos_qualquer_quantidade = 0
-        for k in range(1, len(alcancaveis_creditos)):
-            creditos_qualquer_quantidade |= alcancaveis_creditos[k]
-
-        encontrado = None
-        for tamanho_debitos in range(
-            2, min(max_grupo, len(deb_janela)) + 1
-        ):
-            tamanho_outros = tamanho_debitos - 1
-            somas_comuns = (
-                alcancaveis_debitos[tamanho_outros] << valor_base
-            ) & creditos_qualquer_quantidade
-            if not somas_comuns:
-                continue
-
-            bit_menor = somas_comuns & -somas_comuns
-            alvo = bit_menor.bit_length() - 1
-            mascara_outros = _recuperar_subconjunto(
-                valores_outros_debitos,
-                alvo - valor_base,
-                tamanho_outros,
-                quantidade_preferida=tamanho_outros,
-            )
-            mascara_creditos = _recuperar_subconjunto(
-                valores_creditos, alvo, max_grupo
-            )
-            if mascara_outros is not None and mascara_creditos is not None:
-                encontrado = mascara_outros, mascara_creditos
-                break
-
-        if encontrado is None:
-            continue
-
-        mascara_outros, mascara_creditos = encontrado
-        encontrados_debitos = [i0] + [
-            deb_janela[pos + 1]
-            for pos in range(len(valores_outros_debitos))
-            if (mascara_outros >> pos) & 1
-        ]
-        encontrados_creditos = [
-            cred_janela[pos]
-            for pos in range(len(cred_janela))
-            if (mascara_creditos >> pos) & 1
-        ]
-        debitos_usados.update(encontrados_debitos)
-        creditos_usados.update(encontrados_creditos)
+        resultado = _subset_sum_bitset(valores_cents, alvo_cents)
+        if resultado is not None:
+            debitos_usados.update(idxs)
+            for pos in resultado:
+                creditos_usados.add(candidatos[pos])
 
     return debitos_usados, creditos_usados
 
 
-
 def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, tipo,
                                 janela_dias=60, usar_matching_nfe=True, usar_matching_janela=True,
-                                max_parcelas_nfe=6, max_grupo_janela=6):
+                                max_parcelas_nfe=6, janela_dias_cartao=30):
     if tipo == 'CARTAO':
         col_deb, col_cred = 'Débito', 'Crédito'
     else:
@@ -535,11 +408,11 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
         debitos_restantes = [i for i in debitos_restantes if i not in d_nfe]
         creditos_restantes = [i for i in creditos_restantes if i not in c_nfe]
 
-    # ETAPA 4: matching em grupo por janela (sem identificador - ex: cartão: venda + taxa + recebimento)
+    # ETAPA 4: matching em grupo por dia (sem identificador - ex: cartão: venda + taxa + recebimento)
     if usar_matching_janela:
-        d_jan, c_jan = _matching_por_janela(
+        d_jan, c_jan = _matching_por_dia(
             debitos_restantes, creditos_restantes, todos_debitos, todos_creditos,
-            janela_dias=janela_dias, max_grupo=max_grupo_janela
+            janela_dias=janela_dias_cartao
         )
         debitos_usados |= d_jan
         creditos_usados |= c_jan
@@ -604,9 +477,9 @@ with st.sidebar:
     usar_nfe = st.checkbox("Agrupar por NF-e (nota com CFOP dividido)", value=True)
     max_parcelas = st.number_input("Máx. de parcelas por grupo NF-e", value=6, step=1, min_value=1)
     st.markdown("---")
-    usar_janela = st.checkbox("Agrupar por janela (cartões: máscara de bits)", value=True)
-    st.caption("Para cartões, busca exata em centavos usando inteiros como máscaras de bits; fornecedores permanecem no fluxo sem o fallback de janela.")
-    max_grupo_janela = st.number_input("Máx. de itens por grupo (janela)", value=6, step=1, min_value=1)
+    usar_janela = st.checkbox("Agrupar por dia (sem identificador, ex: cartão)", value=True)
+    janela_dias_cartao = st.number_input("Janela de dias (débito → recebimento)", value=30, step=5, min_value=1)
+    st.caption("Agrupa débitos do mesmo dia e busca uma combinação de créditos que feche o total, dentro da janela.")
 
 col_nat, col_conta = st.columns([1.3, 1])
 with col_nat:
@@ -649,8 +522,8 @@ if arquivo_lancamentos and conta_input != 0:
 
         r_tot, r_ant, r_atual, r_pend, s_tot, s_ant, s_atual, s_pend = processar_razoes_contabeis(
             df_base_geral, conta_input, saldo_abertura_var, tipo_auditoria,
-            janela_dias=janela_dias, usar_matching_nfe=usar_nfe, usar_matching_janela=(usar_janela and tipo_auditoria == 'CARTAO'),
-            max_parcelas_nfe=max_parcelas, max_grupo_janela=max_grupo_janela
+            janela_dias=janela_dias, usar_matching_nfe=usar_nfe, usar_matching_janela=usar_janela,
+            max_parcelas_nfe=max_parcelas, janela_dias_cartao=janela_dias_cartao
         )
 
         if len(r_ant) == 0 and len(r_atual) == 0:
