@@ -165,9 +165,20 @@ def carregar_base_lancamentos(raw_data):
             header_idx = idx
             break
 
+    # O relatório do Domínio repete cada lançamento na seção da conta
+    # e na seção da conta contrapartida. Preservamos a seção original para
+    # que o filtro posterior não some as duas cópias.
+    secao_por_linha = df_raw.iloc[:, 0].astype('string').str.strip()
+    secao_por_linha = secao_por_linha.where(
+        secao_por_linha.str.match(r'^Conta:\s*\d+', na=False),
+        pd.NA
+    ).ffill()
+
     df_clean = df_raw.iloc[header_idx:].copy()
     df_clean.columns = [str(h).strip() for h in df_clean.iloc[0].values]
-    df_clean = df_clean.iloc[1:].dropna(how='all', axis=1).dropna(how='all', axis=0).reset_index(drop=True)
+    df_clean = df_clean.iloc[1:].copy()
+    df_clean['_SecaoConta'] = secao_por_linha.loc[df_clean.index].values
+    df_clean = df_clean.dropna(how='all', axis=1).dropna(how='all', axis=0).reset_index(drop=True)
 
     cols = pd.Series(df_clean.columns)
     for dup in cols[cols.duplicated()].unique():
@@ -183,6 +194,12 @@ def carregar_base_lancamentos(raw_data):
         df_main['Débito'] = pd.to_numeric(df_main['Débito'], errors='coerce')
     if 'Crédito' in df_main.columns:
         df_main['Crédito'] = pd.to_numeric(df_main['Crédito'], errors='coerce')
+
+    secao = df_main['_SecaoConta'].astype('string')
+    df_main['_ContaSecaoNum'] = pd.to_numeric(
+        secao.str.extract(r'^Conta:\s*(\d+)', expand=False),
+        errors='coerce'
+    ).astype('Int64')
 
     return df_main
 
@@ -400,7 +417,17 @@ def processar_razoes_contabeis(df_main, conta_alvo, saldo_anterior_informado, ti
     else:
         col_deb, col_cred = 'Crédito', 'Débito'
 
-    df_alvo = df_main[(df_main['Débito'] == conta_alvo) | (df_main['Crédito'] == conta_alvo)].copy()
+    mask_lancamento = (
+        (df_main['Débito'] == conta_alvo) |
+        (df_main['Crédito'] == conta_alvo)
+    )
+    if '_ContaSecaoNum' in df_main.columns:
+        mask_secao = df_main['_ContaSecaoNum'].eq(int(conta_alvo)).fillna(False)
+        df_alvo = df_main[mask_lancamento & mask_secao].copy()
+    else:
+        # Compatibilidade com bases antigas sem marcador da seção.
+        df_alvo = df_main[mask_lancamento].copy()
+
     saldo_ant = abs(Decimal(str(saldo_anterior_informado)))
 
     todos_debitos = []
